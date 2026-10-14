@@ -458,7 +458,7 @@ def test_stage_version_bump_reruns_only_that_stage(cfg, fakes, monkeypatch):
 
 def test_caption_bump_needs_no_library_reads(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
-    monkeypatch.setattr(captions, "CAPTION_VERSION", "2")
+    monkeypatch.setattr(captions, "CAPTION_VERSION", captions.CAPTION_VERSION + "-bumped")
     fakes.clear()
     sync.run_index(cfg)
     assert fakes["caption"] == N_AUDIO and fakes["read"] == 0 and fakes["decode"] == 0
