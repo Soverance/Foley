@@ -68,6 +68,12 @@ Implementation notes (not contract):
     the lock section); it frees itself if the process dies.
   * If a file's bytes changed without a size/mtime change, all its stage records are
     dropped so every stage re-runs (now or on the next full run).
+  * Scan-time move matching: before anything is marked missing, a vanished (or
+    earlier-missing) asset and a new path with the same casefolded basename, size and
+    mtime form a move when the key is unique on both sides. The asset is re-pointed in
+    the scan transaction with no file read; only caption and fts re-run (plus metadata
+    if the basename's case changed). Ambiguous keys use hash-based detection. The
+    mass-missing guard counts only what is still missing after matching.
 """
 
 from __future__ import annotations
@@ -545,6 +551,20 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
         r for p, r in by_path.items()
         if p not in present and r["status"] != "missing" and not _under(p, error_dirs)
     ]
+    # Scan-time move matching: a rename/move on the same share keeps basename, size and
+    # mtime, so a unique 1:1 match on that key re-points the asset with no file read
+    # (the same trust as an unchanged size+mtime at an unchanged path). Assets missing
+    # since earlier runs are eligible too. Ambiguous keys go to hash-based detection.
+    earlier_missing = [
+        r for p, r in by_path.items()
+        if p not in present and r["status"] == "missing" and not _under(p, error_dirs)
+    ]
+    renamed = _match_renames(gone + earlier_missing, new_files)
+    if renamed:
+        renamed_ids = {r["id"] for r, _ in renamed}
+        renamed_paths = {f.rel_path for _, f in renamed}
+        gone = [r for r in gone if r["id"] not in renamed_ids]
+        new_files = [f for f in new_files if f.rel_path not in renamed_paths]
     active = sum(r["status"] == "active" for r in rows)
     if (not allow_mass_missing and len(gone) >= MASS_MISSING_MIN
             and len(gone) > MASS_MISSING_FRACTION * active):
@@ -561,6 +581,31 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
 
     work: list[_Work] = []
     with db.transaction(conn):
+        for row, f in renamed:
+            pack, category = scan.classify_path(cfg, f.rel_path)
+            # path-derived stages re-run (cheap, no reads); metadata too if only the
+            # basename's case changed (the UCS parse is case-sensitive)
+            stale = ["caption", "fts"]
+            if row["rel_path"].rsplit("/", 1)[-1] != f.rel_path.rsplit("/", 1)[-1]:
+                stale.append("metadata")
+            conn.executemany(
+                "DELETE FROM asset_stages WHERE asset_id=? AND stage=?",
+                [(row["id"], st) for st in stale],
+            )
+            for st in stale:
+                stage_map.get(row["id"], {}).pop(st, None)
+            conn.execute(
+                "UPDATE assets SET rel_path=?, pack=?, category_path=?, ext=?, license=?, "
+                "last_seen=?, missing_since=NULL, status=? WHERE id=?",
+                (f.rel_path, pack, category, f.ext, scan.find_license(cfg, f.rel_path), now,
+                 "active" if all_current(row["id"]) else "pending", row["id"]),
+            )
+            needed = {
+                st for st in requested
+                if force or stage_map.get(row["id"], {}).get(st) != versions[st]
+            }
+            if needed:
+                work.append(_Work(row["id"], f.rel_path, needed, False))
         for f in new_files:
             pack, category = scan.classify_path(cfg, f.rel_path)
             cur = conn.execute(
@@ -602,6 +647,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
     summary.added = len(new_files)
     summary.changed = len(changed)
     summary.missing = len(gone)
+    summary.moved = len(renamed)
 
     changed_ids = {row["id"] for row, _ in changed}
     reappeared_ids = {row["id"] for row in reappeared}
@@ -628,11 +674,30 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
     work.sort(key=lambda w: w.rel_path)
     prog.say(
         f"scanned {summary.scanned} audio files in {time.monotonic() - t0:.1f}s: "
-        f"{summary.added} new, {summary.changed} changed, {summary.missing} missing, "
-        f"{summary.settling} settling, {summary.archives} archives; "
-        f"{len(work)} to analyze"
+        f"{summary.added} new, {summary.changed} changed, "
+        + (f"{len(renamed)} moved (renamed, no reads), " if renamed else "")
+        + f"{summary.missing} missing, {summary.settling} settling, "
+        f"{summary.archives} archives; {len(work)} to analyze"
     )
     return work, result.errors, gone_ids
+
+
+def _match_renames(old_rows, new_files) -> list:
+    """Unique 1:1 pairs (old asset row, new ScannedFile) with the same casefolded
+    basename, size and mtime."""
+    def key(rel: str, size: int, mtime: int) -> tuple:
+        return rel.rsplit("/", 1)[-1].casefold(), size, mtime
+
+    olds: dict[tuple, list] = {}
+    for r in old_rows:
+        olds.setdefault(key(r["rel_path"], r["size_bytes"], r["mtime_ns"]), []).append(r)
+    news: dict[tuple, list] = {}
+    for f in new_files:
+        news.setdefault(key(f.rel_path, f.size_bytes, f.mtime_ns), []).append(f)
+    return [
+        (olds[k][0], fs[0]) for k, fs in news.items()
+        if len(fs) == 1 and len(olds.get(k, ())) == 1
+    ]
 
 
 def default_workers() -> int:

@@ -395,7 +395,7 @@ def test_moved_file_keeps_id_and_analysis(cfg, library, fakes):
     fakes.clear()
     s = sync.run_index(cfg)
     assert (s.moved, s.added, s.missing, s.analyzed, s.errors) == (1, 0, 0, 1, 0)
-    assert fakes["read"] == 1  # hashed once to detect the move
+    assert fakes["read"] == 0  # same name, size and mtime: matched at scan time
     assert fakes["decode"] == 0 and fakes["features"] == 0 and fakes["loudness"] == 0
     assert fakes["caption"] == 1 and fakes["fts"] == 1  # path-derived stages re-run
 
@@ -1327,3 +1327,116 @@ def test_workers_that_cannot_start_fall_back_to_in_process(cfg, fakes, monkeypat
     assert s.analyzed == N_AUDIO and s.errors == 0
     assert any("worker processes unavailable" in line for line in lines)
     assert _statuses(cfg) == Counter(active=N_AUDIO)
+
+
+# --------------------------------------------------------------------------- scan-time moves
+
+
+@both
+def test_folder_rename_moves_without_reads(cfg, library, fakes):
+    for i in range(60):
+        _write_old(library / f"packs/Sonnis Audio - 2020/Hits/hit_{i:03d}.wav",
+                   ag.tone(200 + i, 0.01))
+    sync.run_index(cfg)
+    old_rel = "packs/Sonnis Audio - 2020/Hits/hit_007.wav"
+    before = _asset(cfg, old_rel)
+    conn = _conn(cfg)
+    ids_before = {r[0].split("/", 2)[2]: r[1] for r in conn.execute(
+        "SELECT rel_path, id FROM assets WHERE pack='Sonnis Audio - 2020'")}
+    with db.transaction(conn):
+        conn.execute(
+            "INSERT INTO ledger.decisions(content_hash, rel_path, project, usage_key, verdict, "
+            "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.hit', 'approved', 'scott', ?)",
+            (before["content_hash"], old_rel, db.utcnow()),
+        )
+    conn.close()
+
+    (library / "packs/Sonnis Audio - 2020").rename(library / "packs/Sonniss Audio - 2020")
+    fakes.clear()
+    lines: list[str] = []
+    s = sync.run_index(cfg, progress=lines.append)  # no allow_mass_missing needed
+    assert (s.moved, s.added, s.missing, s.errors) == (60, 0, 0, 0)
+    assert s.analyzed == 60
+    assert fakes["read"] == 0 and fakes["decode"] == 0 and fakes["features"] == 0
+    assert fakes["caption"] == 60 and fakes["fts"] == 60
+    assert any("60 moved (renamed, no reads)" in line for line in lines)
+
+    conn = _conn(cfg)
+    ids_after = {r[0].split("/", 2)[2]: r[1] for r in conn.execute(
+        "SELECT rel_path, id FROM assets WHERE pack='Sonniss Audio - 2020'")}
+    assert ids_after == ids_before
+    assert _one(conn, "SELECT count(*) FROM assets WHERE rel_path LIKE 'packs/Sonnis %'") == 0
+    new_rel = "packs/Sonniss Audio - 2020/Hits/hit_007.wav"
+    row = dict(conn.execute("SELECT * FROM assets WHERE rel_path=?", (new_rel,)).fetchone())
+    assert row["content_hash"] == before["content_hash"]
+    assert row["source_metadata"] == before["source_metadata"]
+    assert row["category_path"] == "Hits" and row["status"] == "active"
+    assert _one(conn, "SELECT name FROM search_fts WHERE rowid=?", row["id"]) == new_rel
+    hit = conn.execute(
+        "SELECT a.rel_path FROM ledger.decisions d JOIN assets a "
+        "ON a.content_hash = d.content_hash WHERE a.status = 'active'"
+    ).fetchone()
+    assert hit[0] == new_rel
+    conn.close()
+    fakes.clear()
+    assert sync.run_index(cfg).analyzed == 0 and sum(fakes.values()) == 0
+
+
+@both
+def test_ambiguous_rename_keys_fall_back_to_hashing(cfg, library, fakes):
+    # two identical copies (same name, size, mtime) in different folders, both moved
+    shutil.copy2(library / CLICK, library / "voice/click.wav")
+    sync.run_index(cfg)
+    ids = {_asset(cfg, CLICK)["id"], _asset(cfg, "voice/click.wav")["id"]}
+    (library / "moved/a").mkdir(parents=True)
+    (library / "moved/b").mkdir(parents=True)
+    shutil.move(library / CLICK, library / "moved/a/click.wav")
+    shutil.move(library / "voice/click.wav", library / "moved/b/click.wav")
+    fakes.clear()
+    s = sync.run_index(cfg)
+    assert (s.moved, s.added, s.missing) == (2, 0, 0)
+    assert fakes["read"] == 2  # hash-based detection
+    assert {_asset(cfg, "moved/a/click.wav")["id"], _asset(cfg, "moved/b/click.wav")["id"]} == ids
+
+
+@both
+def test_rename_with_different_mtime_is_not_scan_matched(cfg, library, fakes):
+    sync.run_index(cfg)
+    before = _asset(cfg, CLICK)
+    (library / "sfx/ui").mkdir()
+    shutil.move(library / CLICK, library / "sfx/ui/click.wav")
+    _old(library / "sfx/ui/click.wav", OLD_MTIME + 60)
+    fakes.clear()
+    s = sync.run_index(cfg)
+    assert fakes["read"] == 1  # same name and size, other mtime: verified by hash
+    assert (s.moved, s.added, s.missing) == (1, 0, 0)
+    after = _asset(cfg, "sfx/ui/click.wav")
+    assert after["id"] == before["id"] and after["mtime_ns"] == (OLD_MTIME + 60) * 10**9
+
+
+def test_earlier_missing_asset_matches_at_scan_time(cfg, library, fakes, tmp_path):
+    sync.run_index(cfg)
+    before = _asset(cfg, LASER)
+    shutil.move(library / LASER, tmp_path / "lasrhit3.WAV")
+    assert sync.run_index(cfg).missing == 1
+    (library / "sfx/sabers").mkdir()
+    shutil.move(tmp_path / "lasrhit3.WAV", library / "sfx/sabers/lasrhit3.WAV")
+    fakes.clear()
+    s = sync.run_index(cfg)
+    assert (s.moved, s.added, s.missing) == (1, 0, 0) and fakes["read"] == 0
+    after = _asset(cfg, "sfx/sabers/lasrhit3.WAV")
+    assert after["id"] == before["id"] and after["status"] == "active"
+    assert after["missing_since"] is None
+
+
+def test_case_only_basename_change_rereads_metadata_only(cfg, library, fakes):
+    sync.run_index(cfg)
+    before = _asset(cfg, LASER)
+    (library / "sfx/sabers").mkdir()
+    shutil.move(library / LASER, library / "sfx/sabers/LASRHIT3.wav")
+    fakes.clear()
+    s = sync.run_index(cfg)
+    assert (s.moved, s.added, s.missing) == (1, 0, 0)
+    assert fakes["read"] == 1 and fakes["decode"] == 0
+    after = _asset(cfg, "sfx/sabers/LASRHIT3.wav")
+    assert after["id"] == before["id"] and after["status"] == "active"
