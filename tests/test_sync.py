@@ -466,7 +466,7 @@ def test_caption_bump_needs_no_library_reads(cfg, fakes, monkeypatch):
 
 def test_metadata_only_rerun_does_not_decode(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
-    monkeypatch.setattr(scan, "METADATA_VERSION", "2")
+    monkeypatch.setattr(scan, "METADATA_VERSION", scan.METADATA_VERSION + "-bumped")
     fakes.clear()
     sync.run_index(cfg)
     assert fakes["read"] == N_AUDIO and fakes["decode"] == 0 and fakes["features"] == 0
@@ -798,7 +798,7 @@ def test_root_vanishing_mid_run_aborts(cfg, library, fakes, monkeypatch):
         return real(path)
 
     monkeypatch.setattr(decode, "read_bytes", dropping)
-    monkeypatch.setattr(scan, "METADATA_VERSION", "2")
+    monkeypatch.setattr(scan, "METADATA_VERSION", scan.METADATA_VERSION + "-bumped")
     with pytest.raises(sync.LibraryUnavailable, match="became unreachable"):
         sync.run_index(cfg, force=True)
     assert _statuses(cfg) == Counter(active=N_AUDIO)
