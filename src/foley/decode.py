@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -189,8 +190,13 @@ def decode_bytes(data: bytes, ext: str) -> DecodedAudio:
     return audio
 
 
+_OBJECT_REPR = re.compile(r"<[\w.]+ object at 0x[0-9A-Fa-f]+>")
+
+
 def _reason(exc: Exception) -> str:
-    msg = str(exc).strip() or type(exc).__name__
+    # Drop object reprs ("<_io.BytesIO object at 0x...>") so identical failures give
+    # identical error text from run to run.
+    msg = _OBJECT_REPR.sub("<file>", str(exc)).strip() or type(exc).__name__
     return msg.splitlines()[0][:300]
 
 

@@ -6,6 +6,7 @@ so they test sync itself; test_end_to_end_real_pipeline runs the real modules.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ LASER = "sfx/lightsabers/lasrhit3.WAV"
 CLICK = "sfx/click.wav"
 
 _AUDIO_MAGIC = (b"RIFF", b"RF64", b"fLaC", b"OggS", b"FORM")
+_REAL_RUN_INDEX = sync.run_index
 
 
 def _looks_like_audio(data: bytes) -> bool:
@@ -43,12 +45,25 @@ def _looks_like_audio(data: bytes) -> bool:
     return len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
 
 
-def install_fakes(monkeypatch) -> Counter:
-    """Replace every sibling pipeline function with a fast fake; returns call counts."""
-    calls: Counter = Counter()
+def _env_names(var: str) -> set[str]:
+    return {n for n in os.environ.get(var, "").split(",") if n}
+
+
+def _make_fakes(record) -> dict:
+    """Fast stand-ins for the sibling pipeline functions. Behaviour switches come from
+    environment variables so they also apply inside spawned analysis workers:
+    FOLEY_TEST_FAIL_READ / FOLEY_TEST_CRASH (comma-separated basenames, or *) and
+    FOLEY_TEST_FAIL_KIND (kind_hint whose feature computation raises)."""
 
     def read_bytes(path):
-        calls["read"] += 1
+        record("read")
+        name = Path(path).name
+        crash = _env_names("FOLEY_TEST_CRASH")
+        if name in crash or "*" in crash:
+            os._exit(3)  # simulate a worker dying (segfault / out of memory)
+        fail = _env_names("FOLEY_TEST_FAIL_READ")
+        if name in fail or "*" in fail:
+            raise OSError(64, "The specified network name is no longer available")
         with open(path, "rb") as f:
             return f.read()
 
@@ -56,7 +71,7 @@ def install_fakes(monkeypatch) -> Counter:
         return xxhash.xxh3_128_hexdigest(data)
 
     def decode_bytes(data, ext):
-        calls["decode"] += 1
+        record("decode")
         if not _looks_like_audio(data):
             raise decode.DecodeError(f"not a decodable {ext} file")
         digest = np.frombuffer(xxhash.xxh3_128(data).digest(), dtype=np.uint8)
@@ -67,8 +82,10 @@ def install_fakes(monkeypatch) -> Counter:
         return xxhash.xxh3_128_hexdigest(audio.samples.tobytes())
 
     def compute_features(audio, kind_hint):
-        calls["features"] += 1
-        calls[f"kind:{kind_hint}"] += 1
+        record("features")
+        record(f"kind:{kind_hint}")
+        if kind_hint and kind_hint in _env_names("FOLEY_TEST_FAIL_KIND"):
+            raise ValueError("librosa exploded")
         return {
             "duration_s": 1.0, "sample_rate": 48000, "channels": 1,
             "lead_silence_s": 0.0, "tail_silence_s": 0.1, "attack_s": 0.01, "decay_s": 0.2,
@@ -80,34 +97,103 @@ def install_fakes(monkeypatch) -> Counter:
         }
 
     def measure(audio):
-        calls["loudness"] += 1
+        record("loudness")
         return {"lufs_integrated": -20.0, "lufs_short_max": -18.0, "true_peak_db": -3.0}
 
     def templated_caption(asset, feats, tags, metadata):
-        calls["caption"] += 1
+        record("caption")
         assert tags == []
         return f"caption for {asset['rel_path']} ({feats.get('lufs_integrated')} LUFS)"
 
     def index_asset(conn, asset_id):
-        calls["fts"] += 1
+        record("fts")
         rel = conn.execute("SELECT rel_path FROM assets WHERE id=?", (asset_id,)).fetchone()[0]
         conn.execute("DELETE FROM search_fts WHERE rowid=?", (asset_id,))
         conn.execute("INSERT INTO search_fts(rowid, name) VALUES (?, ?)", (asset_id, rel))
 
-    monkeypatch.setattr(decode, "read_bytes", read_bytes)
-    monkeypatch.setattr(decode, "content_hash", content_hash)
-    monkeypatch.setattr(decode, "decode_bytes", decode_bytes)
-    monkeypatch.setattr(decode, "audio_hash", audio_hash)
-    monkeypatch.setattr(features, "compute_features", compute_features)
-    monkeypatch.setattr(loudness, "measure", measure)
-    monkeypatch.setattr(captions, "templated_caption", templated_caption)
-    monkeypatch.setattr(search, "index_asset", index_asset)
+    return {
+        (decode, "read_bytes"): read_bytes,
+        (decode, "content_hash"): content_hash,
+        (decode, "decode_bytes"): decode_bytes,
+        (decode, "audio_hash"): audio_hash,
+        (features, "compute_features"): compute_features,
+        (loudness, "measure"): measure,
+        (captions, "templated_caption"): templated_caption,
+        (search, "index_asset"): index_asset,
+    }
+
+
+class CallCounts:
+    """Call counts from this process plus any analysis workers (one log file each)."""
+
+    def __init__(self) -> None:
+        self.main: Counter = Counter()
+        self.log_dir: Path | None = None
+
+    def record(self, name: str) -> None:
+        self.main[name] += 1
+
+    def _all(self) -> Counter:
+        total = Counter(self.main)
+        if self.log_dir is not None and self.log_dir.exists():
+            for log in self.log_dir.glob("*.log"):
+                total.update(log.read_text().split())
+        return total
+
+    def __getitem__(self, name: str) -> int:
+        return self._all()[name]
+
+    def values(self):
+        return self._all().values()
+
+    def clear(self) -> None:
+        self.main.clear()
+        if self.log_dir is not None:
+            for log in self.log_dir.glob("*.log"):
+                log.unlink()
+
+
+def install_fakes(monkeypatch) -> CallCounts:
+    """Replace every sibling pipeline function with a fast fake; returns call counts."""
+    calls = CallCounts()
+    for (module, name), fn in _make_fakes(calls.record).items():
+        monkeypatch.setattr(module, name, fn)
+    # fakes live in this process only: analyze in-process unless a test opts in
+    monkeypatch.setattr(sync, "run_index", functools.partial(_REAL_RUN_INDEX, workers=1))
     return calls
 
 
+def _worker_fakes() -> None:
+    """sync.WORKER_INIT_HOOK target: the same fakes inside a spawned analysis worker."""
+    log = Path(os.environ["FOLEY_TEST_CALL_LOG_DIR"]) / f"{os.getpid()}.log"
+
+    def record(name: str) -> None:
+        with open(log, "a") as f:
+            f.write(name + "\n")
+
+    for (module, name), fn in _make_fakes(record).items():
+        setattr(module, name, fn)
+
+
 @pytest.fixture
-def fakes(monkeypatch) -> Counter:
-    return install_fakes(monkeypatch)
+def workers() -> int:
+    """Analysis processes for run_index in this test; parametrize to override."""
+    return 1
+
+
+@pytest.fixture
+def fakes(monkeypatch, workers, tmp_path) -> CallCounts:
+    calls = install_fakes(monkeypatch)
+    monkeypatch.setattr(sync, "run_index", functools.partial(_REAL_RUN_INDEX, workers=workers))
+    if workers > 1:
+        calls.log_dir = tmp_path / "worker-calls"
+        calls.log_dir.mkdir()
+        monkeypatch.setenv("FOLEY_TEST_CALL_LOG_DIR", str(calls.log_dir))
+        monkeypatch.setattr(sync, "WORKER_INIT_HOOK", "test_sync:_worker_fakes")
+    return calls
+
+
+both = pytest.mark.parametrize("workers", [1, 2])
 
 
 def _conn(cfg):
@@ -151,6 +237,7 @@ def _write_old(path: Path, x, t: int = OLD_MTIME) -> None:
 # --------------------------------------------------------------------------- basics
 
 
+@both
 def test_first_run_indexes_everything(cfg, fakes):
     lines: list[str] = []
     s = sync.run_index(cfg, progress=lines.append)
@@ -201,6 +288,7 @@ def test_first_run_indexes_everything(cfg, fakes):
     assert any(line.startswith("analyzed") for line in lines)
 
 
+@both
 def test_second_run_is_a_no_op(cfg, fakes):
     sync.run_index(cfg)
     fakes.clear()
@@ -220,6 +308,7 @@ def test_unknown_stage_rejected(cfg, fakes):
 # --------------------------------------------------------------------------- rules table
 
 
+@both
 def test_new_file_is_analyzed(cfg, library, fakes):
     sync.run_index(cfg)
     _write_old(library / "sfx/new_boom.wav", ag.burst(0.4, seed=9))
@@ -230,6 +319,7 @@ def test_new_file_is_analyzed(cfg, library, fakes):
     assert _asset(cfg, "sfx/new_boom.wav")["status"] == "active"
 
 
+@both
 def test_changed_file_reanalyzed_with_same_id(cfg, library, fakes):
     sync.run_index(cfg)
     before = _asset(cfg, CLICK)
@@ -257,6 +347,7 @@ def test_touched_file_with_same_bytes_counts_as_changed(cfg, library, fakes):
     assert after["mtime_ns"] == (OLD_MTIME + 5) * 10**9
 
 
+@both
 def test_missing_file_keeps_row_and_reappears(cfg, library, fakes, tmp_path):
     sync.run_index(cfg)
     before = _asset(cfg, LASER)
@@ -283,6 +374,7 @@ def test_missing_file_keeps_row_and_reappears(cfg, library, fakes, tmp_path):
     assert row["status"] == "active" and row["missing_since"] is None and row["id"] == before["id"]
 
 
+@both
 def test_moved_file_keeps_id_and_analysis(cfg, library, fakes):
     sync.run_index(cfg)
     before = _asset(cfg, GORE)
@@ -335,6 +427,7 @@ def test_moved_file_keeps_id_and_analysis(cfg, library, fakes):
     assert sync.run_index(cfg).analyzed == 0 and fakes["read"] == 0
 
 
+@both
 def test_move_detected_across_runs(cfg, library, fakes, tmp_path):
     sync.run_index(cfg)
     before = _asset(cfg, CLICK)
@@ -346,6 +439,7 @@ def test_move_detected_across_runs(cfg, library, fakes, tmp_path):
     assert _asset(cfg, "sfx/ui_click_renamed.wav")["id"] == before["id"]
 
 
+@both
 def test_copy_of_existing_file_is_new_not_moved(cfg, library, fakes):
     sync.run_index(cfg)
     shutil.copy2(library / CLICK, library / "sfx/click_copy.wav")
@@ -394,6 +488,7 @@ def test_archives_table_tracks_archives(cfg, library, fakes):
     conn.close()
 
 
+@both
 def test_decode_failure_sets_error_and_retries(cfg, library, fakes):
     bad = library / "sfx/broken.wav"
     bad.write_bytes(b"BAD!" + b"\x00" * 100)
@@ -421,15 +516,9 @@ def test_decode_failure_sets_error_and_retries(cfg, library, fakes):
     assert row["status"] == "active" and row["error"] is None and row["error_count"] == 0
 
 
+@both
 def test_any_stage_exception_is_recorded_not_fatal(cfg, monkeypatch, fakes):
-    real = features.compute_features
-
-    def flaky(audio, kind):
-        if kind == "music":
-            raise ValueError("librosa exploded")
-        return real(audio, kind)
-
-    monkeypatch.setattr(features, "compute_features", flaky)
+    monkeypatch.setenv("FOLEY_TEST_FAIL_KIND", "music")
     s = sync.run_index(cfg)
     assert s.errors == 1 and s.analyzed == N_AUDIO - 1
     row = _asset(cfg, "music/Arteria3D/Battle Loop.mp3")
@@ -439,6 +528,7 @@ def test_any_stage_exception_is_recorded_not_fatal(cfg, monkeypatch, fakes):
 # --------------------------------------------------------------------------- stages
 
 
+@both
 def test_stage_version_bump_reruns_only_that_stage(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
     monkeypatch.setattr(loudness, "LOUDNESS_VERSION", "999")
@@ -456,6 +546,7 @@ def test_stage_version_bump_reruns_only_that_stage(cfg, fakes, monkeypatch):
     assert _statuses(cfg) == Counter(active=N_AUDIO)
 
 
+@both
 def test_caption_bump_needs_no_library_reads(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
     monkeypatch.setattr(captions, "CAPTION_VERSION", captions.CAPTION_VERSION + "-bumped")
@@ -464,6 +555,7 @@ def test_caption_bump_needs_no_library_reads(cfg, fakes, monkeypatch):
     assert fakes["caption"] == N_AUDIO and fakes["read"] == 0 and fakes["decode"] == 0
 
 
+@both
 def test_metadata_only_rerun_does_not_decode(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
     monkeypatch.setattr(scan, "METADATA_VERSION", scan.METADATA_VERSION + "-bumped")
@@ -472,6 +564,7 @@ def test_metadata_only_rerun_does_not_decode(cfg, fakes, monkeypatch):
     assert fakes["read"] == N_AUDIO and fakes["decode"] == 0 and fakes["features"] == 0
 
 
+@both
 def test_stages_filter_and_force(cfg, fakes):
     sync.run_index(cfg)
     fakes.clear()
@@ -482,6 +575,7 @@ def test_stages_filter_and_force(cfg, fakes):
     assert fakes["caption"] == N_AUDIO and fakes["fts"] == N_AUDIO and fakes["read"] == 0
 
 
+@both
 def test_stage_subset_on_new_files_leaves_them_pending(cfg, fakes):
     s = sync.run_index(cfg, stages=["metadata"])
     assert s.analyzed == N_AUDIO and fakes["decode"] == 0
@@ -492,6 +586,7 @@ def test_stage_subset_on_new_files_leaves_them_pending(cfg, fakes):
     assert _statuses(cfg) == Counter(active=N_AUDIO)
 
 
+@both
 def test_limit_caps_files_analyzed(cfg, fakes):
     s = sync.run_index(cfg, limit=3)
     assert s.added == N_AUDIO and s.analyzed == 3
@@ -503,19 +598,25 @@ def test_limit_caps_files_analyzed(cfg, fakes):
 # --------------------------------------------------------------------------- resume
 
 
+@both
 def test_interrupt_and_resume(cfg, fakes, monkeypatch):
-    real = features.compute_features
+    # Ctrl+C arrives in the main process while it handles the third file (the caption
+    # step runs there in both modes, before that file's transaction).
+    real = captions.templated_caption
     seen = Counter()
 
-    def interrupting(audio, kind):
+    def interrupting(asset, feats, tags, metadata):
         seen["n"] += 1
         if seen["n"] == 3:
             raise KeyboardInterrupt
-        return real(audio, kind)
+        return real(asset, feats, tags, metadata)
 
-    monkeypatch.setattr(features, "compute_features", interrupting)
+    monkeypatch.setattr(captions, "templated_caption", interrupting)
     s = sync.run_index(cfg)
     assert s.interrupted and s.analyzed == 2
+    import multiprocessing
+
+    assert multiprocessing.active_children() == []  # workers were stopped
     assert _lock_free(cfg)
     assert _statuses(cfg) == Counter(active=2, pending=N_AUDIO - 2)
     conn = _conn(cfg)
@@ -523,7 +624,7 @@ def test_interrupt_and_resume(cfg, fakes, monkeypatch):
     assert run["status"] == "interrupted" and run["finished_at"] and run["analyzed"] == 2
     conn.close()
 
-    monkeypatch.setattr(features, "compute_features", real)
+    monkeypatch.setattr(captions, "templated_caption", real)
     fakes.clear()
     s = sync.run_index(cfg)
     assert not s.interrupted and s.analyzed == N_AUDIO - 2 and s.added == 0
@@ -531,6 +632,7 @@ def test_interrupt_and_resume(cfg, fakes, monkeypatch):
     assert _statuses(cfg) == Counter(active=N_AUDIO)
 
 
+@both
 def test_interrupt_inside_the_commit_leaves_asset_pending(cfg, fakes, monkeypatch):
     real = search.index_asset
 
@@ -751,16 +853,10 @@ def test_data_dir_inside_library_is_rejected(tmp_path, library):
 # --------------------------------------------------------------------------- share trouble
 
 
+@both
 def test_read_error_keeps_analyzed_assets_searchable(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
-    real = decode.read_bytes
-
-    def flaky(path):
-        if Path(path).name == "click.wav":
-            raise OSError(64, "The specified network name is no longer available")
-        return real(path)
-
-    monkeypatch.setattr(decode, "read_bytes", flaky)
+    monkeypatch.setenv("FOLEY_TEST_FAIL_READ", "click.wav")
     monkeypatch.setattr(loudness, "LOUDNESS_VERSION", "77")
     s = sync.run_index(cfg)
     assert s.errors == 1 and s.analyzed == N_AUDIO - 1 and not s.interrupted
@@ -778,26 +874,28 @@ def test_read_error_keeps_analyzed_assets_searchable(cfg, fakes, monkeypatch):
     s = sync.run_index(cfg)
     assert _asset(cfg, "sfx/new/click.wav")["status"] == "error"
 
-    monkeypatch.setattr(decode, "read_bytes", real)
+    monkeypatch.delenv("FOLEY_TEST_FAIL_READ")
     s = sync.run_index(cfg)
     row = _asset(cfg, CLICK)
     assert s.errors == 0 and row["status"] == "active" and row["error"] is None
 
 
+@both
 def test_root_vanishing_mid_run_aborts(cfg, library, fakes, monkeypatch):
     sync.run_index(cfg)
-    real = decode.read_bytes
-    calls = Counter()
+    # the share drops after two files: reads fail and the root is gone
+    real_analyze = sync._analyze
+    seen = Counter()
 
-    def dropping(path):
-        calls["n"] += 1
-        if calls["n"] == 3:
+    def analyze(*args, **kwargs):
+        seen["n"] += 1
+        if seen["n"] == 3:
+            monkeypatch.setenv("FOLEY_TEST_FAIL_READ", "*")
             monkeypatch.setattr(sync, "_root_reachable", lambda c: False)
-        if calls["n"] >= 3:
-            raise OSError(53, "The network path was not found")
-        return real(path)
+            raise sync.LibraryReadError("read failed: OSError: network path not found")
+        return real_analyze(*args, **kwargs)
 
-    monkeypatch.setattr(decode, "read_bytes", dropping)
+    monkeypatch.setattr(sync, "_analyze", analyze)
     monkeypatch.setattr(scan, "METADATA_VERSION", scan.METADATA_VERSION + "-bumped")
     with pytest.raises(sync.LibraryUnavailable, match="became unreachable"):
         sync.run_index(cfg, force=True)
@@ -811,14 +909,11 @@ def test_root_vanishing_mid_run_aborts(cfg, library, fakes, monkeypatch):
     assert _lock_free(cfg)
 
 
+@both
 def test_consecutive_read_errors_abort(cfg, fakes, monkeypatch):
     sync.run_index(cfg)
     monkeypatch.setattr(sync, "MAX_CONSECUTIVE_READ_ERRORS", 3)
-
-    def failing(path):
-        raise PermissionError(13, "Access is denied")
-
-    monkeypatch.setattr(decode, "read_bytes", failing)
+    monkeypatch.setenv("FOLEY_TEST_FAIL_READ", "*")
     with pytest.raises(sync.LibraryUnavailable, match="3 library reads failed in a row"):
         sync.run_index(cfg, force=True)
     assert _statuses(cfg) == Counter(active=N_AUDIO)
@@ -827,6 +922,7 @@ def test_consecutive_read_errors_abort(cfg, fakes, monkeypatch):
     conn.close()
 
 
+@both
 def test_hash_change_without_stat_change_invalidates_all_stages(cfg, library, fakes):
     sync.run_index(cfg)
     path = library / CLICK
@@ -913,6 +1009,7 @@ def test_quarantine_under_root_is_not_indexed(cfg, library, fakes):
     assert s.scanned == N_AUDIO
 
 
+@both
 def test_progress_lines_every_50_files(cfg, library, fakes):
     for i in range(60):
         _write_old(library / f"sfx/bulk/b{i:03d}.wav", ag.tone(200 + i, 0.01))
@@ -1105,3 +1202,128 @@ def test_end_to_end_real_pipeline(cfg, library, tmp_path):
     conn.close()
     s = sync.run_index(cfg)
     assert s.analyzed == 0 and s.errors == 0
+
+
+# --------------------------------------------------------------------------- parallel
+
+
+@pytest.mark.parametrize("workers", [2])
+def test_worker_crash_costs_only_that_file(cfg, fakes, monkeypatch):
+    monkeypatch.setenv("FOLEY_TEST_CRASH", "click.wav")
+    lines: list[str] = []
+    s = sync.run_index(cfg, progress=lines.append)
+    assert not s.interrupted and s.errors == 1 and s.analyzed == N_AUDIO - 1
+    row = _asset(cfg, CLICK)
+    assert row["status"] == "error" and "worker process crashed" in row["error"]
+    assert _statuses(cfg) == Counter(active=N_AUDIO - 1, error=1)
+    monkeypatch.delenv("FOLEY_TEST_CRASH")
+    s = sync.run_index(cfg)
+    assert s.analyzed == 1 and _asset(cfg, CLICK)["status"] == "active"
+
+
+def test_default_workers_bounds(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    assert sync.default_workers() == 8
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    assert sync.default_workers() == 2
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+    assert sync.default_workers() == 1
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert sync.default_workers() == 1
+
+
+def test_auto_workers_keeps_small_runs_in_process(cfg, fakes, monkeypatch):
+    monkeypatch.setattr(sync, "run_index", _REAL_RUN_INDEX)
+    monkeypatch.setattr(sync, "default_workers", lambda: 8)
+    lines: list[str] = []
+    s = sync.run_index(cfg, progress=lines.append)  # 12 files <= 8 workers? no: 12 > 8
+    assert s.analyzed == N_AUDIO
+    assert any("worker processes" in line for line in lines) is (N_AUDIO > 8)
+    _write_old(cfg.library_root / "sfx/one_more.wav", ag.click())
+    lines.clear()
+    sync.run_index(cfg, progress=lines.append)
+    assert not any("worker processes" in line for line in lines)
+
+
+def _catalog_dump(cfg) -> dict:
+    conn = _conn(cfg)
+    try:
+        out = {}
+        import re
+
+        out["assets"] = sorted(
+            # decoder messages may embed object addresses ("<BytesIO at 0x...>")
+            tuple(r)[:-2] + (re.sub(r" at 0x[0-9A-Fa-f]+", "", r[-2] or ""), r[-1])
+            for r in conn.execute(
+                "SELECT rel_path, pack, category_path, ext, size_bytes, mtime_ns, content_hash, "
+                "audio_hash, license, source_metadata, status, error, error_count FROM assets"
+            )
+        )
+        cols = ", ".join(sync.FEATURE_COLUMNS)
+        out["features"] = sorted(
+            tuple(r) for r in conn.execute(
+                f"SELECT a.rel_path, {cols} FROM features f JOIN assets a ON a.id=f.asset_id"
+            )
+        )
+        out["captions"] = sorted(tuple(r) for r in conn.execute(
+            "SELECT a.rel_path, c.model, c.text FROM captions c JOIN assets a ON a.id=c.asset_id"))
+        out["stages"] = sorted(tuple(r) for r in conn.execute(
+            "SELECT a.rel_path, s.stage, s.version FROM asset_stages s "
+            "JOIN assets a ON a.id=s.asset_id"))
+        out["fts"] = sorted(tuple(r) for r in conn.execute(
+            "SELECT a.rel_path, f.name, f.pack, f.category, f.metadata, f.caption "
+            "FROM search_fts f JOIN assets a ON a.id=f.rowid"))
+        return out
+    finally:
+        conn.close()
+
+
+def test_parallel_matches_serial_with_real_modules(library, tmp_path, monkeypatch):
+    """workers=1 (reference) and workers=3 produce the same catalog, over a first index,
+    then moves + a copy + a changed file + a metadata version bump."""
+    reason = siblings_ready(tmp_path)
+    if reason:
+        pytest.skip(reason)
+    from foley.config import Config
+
+    bad = library / "sfx/broken.wav"
+    bad.write_bytes(b"RIFF\x10\x00\x00\x00WAVEjunk")
+    os.utime(bad, (OLD_MTIME, OLD_MTIME))
+    cfgs = {w: Config(library_root=library, data_dir=tmp_path / f"data{w}") for w in (1, 3)}
+
+    def run_both(expect) -> None:
+        dumps = []
+        for w, cfg in cfgs.items():
+            s = sync.run_index(cfg, workers=w)
+            expect(s)
+            dumps.append(_catalog_dump(cfg))
+        for key in dumps[0]:
+            diff = set(dumps[0][key]) ^ set(dumps[1][key])
+            assert not diff, (key, sorted(diff, key=str)[:4])
+
+    def first(s):
+        assert s.analyzed == N_AUDIO and s.errors == 1, s
+
+    run_both(first)
+
+    (library / "sfx/gore").mkdir()
+    shutil.move(library / GORE, library / "sfx/gore/GOREMisc_Moved_ME_Lib.wav")
+    shutil.move(library / LASER, library / "sfx/lasrhit3_renamed.wav")
+    shutil.copy2(library / CLICK, library / "sfx/click_copy.wav")
+    _write_old(library / "sfx/CancelMaybe.wav", ag.tone(700, 0.3), t=OLD_MTIME + 7)
+    monkeypatch.setattr(scan, "METADATA_VERSION", scan.METADATA_VERSION + "-bumped")
+
+    def second(s):
+        assert (s.moved, s.added, s.changed, s.missing, s.errors) == (2, 1, 1, 0, 1), s
+
+    run_both(second)
+
+
+@pytest.mark.parametrize("workers", [2])
+def test_workers_that_cannot_start_fall_back_to_in_process(cfg, fakes, monkeypatch):
+    monkeypatch.setattr(sync, "WORKER_INIT_HOOK", "no_such_module_for_foley_tests:hook")
+    lines: list[str] = []
+    s = sync.run_index(cfg, progress=lines.append)
+    assert s.analyzed == N_AUDIO and s.errors == 0
+    assert any("worker processes unavailable" in line for line in lines)
+    assert _statuses(cfg) == Counter(active=N_AUDIO)

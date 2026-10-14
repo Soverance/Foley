@@ -14,7 +14,7 @@ CONTRACT:
 
     run_index(cfg, stages: list[str] | None = None, force: bool = False,
               limit: int | None = None, progress: Callable[[str], None] | None = None,
-              allow_mass_missing: bool = False) -> RunSummary
+              allow_mass_missing: bool = False, workers: int | None = None) -> RunSummary
         Implements "Library sync" in docs/handoffs/AudioCatalog.md exactly:
         lock file (IndexLocked if held by a live process; stale locks recovered),
         index_runs row, scan, diff by (rel_path, size, mtime_ns), settle window,
@@ -30,6 +30,17 @@ CONTRACT:
         becomes unreachable or MAX_CONSECUTIVE_READ_ERRORS reads fail in a row during
         analysis. A failed read of a file that was analyzed before records the error
         text/count but keeps the asset's status (it stays searchable).
+        `workers`: analysis processes. None = auto (default_workers():
+        min(cpu_count - 2, 8), at least 1; small runs stay in-process); 1 = in-process
+        (the reference path); N > 1 = N spawned workers that read, hash, parse metadata,
+        decode and measure, while this process alone writes SQLite (move resolution,
+        captions, FTS, stages, status) in the same per-file transaction. Results are
+        identical to workers=1; files over LARGE_FILE_BYTES and files needing no read
+        run in this process. A crashed worker costs only the file it was on (recorded
+        as an error after an isolated retry); Ctrl+C stops the workers and leaves
+        unfinished files pending.
+
+    default_workers() -> int
 
     prune(cfg, dry_run: bool = True) -> list[str]
         rel_paths of `missing` assets older than prune_missing_days with no ledger
@@ -400,6 +411,7 @@ def run_index(
     limit: int | None = None,
     progress: Callable[[str], None] | None = None,
     allow_mass_missing: bool = False,
+    workers: int | None = None,
 ) -> RunSummary:
     requested = list(dict.fromkeys(stages)) if stages else list(STAGES)
     unknown = [s for s in requested if s not in STAGES]
@@ -412,7 +424,8 @@ def run_index(
         conn = db.open_catalog(cfg)
         try:
             return _run(
-                cfg, conn, requested, force, limit, _Progress(progress), allow_mass_missing
+                cfg, conn, requested, force, limit, _Progress(progress), allow_mass_missing,
+                workers,
             )
         finally:
             conn.close()
@@ -420,7 +433,8 @@ def run_index(
         _release_lock(cfg, lock)
 
 
-def _run(cfg, conn, requested, force, limit, prog: _Progress, allow_mass_missing=False):
+def _run(cfg, conn, requested, force, limit, prog: _Progress, allow_mass_missing=False,
+         workers: int | None = 1):
     with db.transaction(conn):
         # We hold the lock, so any run still marked 'running' died without finishing.
         conn.execute(
@@ -441,7 +455,7 @@ def _run(cfg, conn, requested, force, limit, prog: _Progress, allow_mass_missing
             note = json.dumps({"scan_errors": scan_errors[:50]})
         if limit is not None:
             work = work[: max(limit, 0)]
-        _analyze_all(cfg, conn, work, requested, force, summary, prog, gone_ids)
+        _analyze_all(cfg, conn, work, requested, force, summary, prog, gone_ids, workers)
         status = "completed"
     except KeyboardInterrupt:
         summary.interrupted = True
@@ -621,57 +635,331 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
     return work, result.errors, gone_ids
 
 
+def default_workers() -> int:
+    """Auto worker count: leave two CPUs for the OS and the main (SQLite) process."""
+    return max(1, min((os.cpu_count() or 1) - 2, 8))
+
+
+def _handle(cfg, conn, item: _Work, summary: RunSummary, prog: _Progress, gone_ids,
+            state: dict, step: Callable[[], int | None]) -> None:
+    """Run one file's step (analysis + commit) with the shared error semantics."""
+    try:
+        moved_from = step()
+    except KeyboardInterrupt:
+        raise
+    except LibraryReadError as e:
+        if not _root_reachable(cfg):
+            raise LibraryUnavailable(
+                f"the library root {cfg.library_root} became unreachable during the run "
+                f"({e}); stopped. Run `foley index` again once the share is back."
+            ) from e
+        state["read_errors"] += 1
+        summary.errors += 1
+        _record_error(conn, item.asset_id, str(e), keep_analyzed=True)
+        prog.say(f"  error: {item.rel_path}: {e}"[:300])
+        if state["read_errors"] >= MAX_CONSECUTIVE_READ_ERRORS:
+            raise LibraryUnavailable(
+                f"{state['read_errors']} library reads failed in a row (last: {item.rel_path}: "
+                f"{e}); stopped. Check the share and run `foley index` again."
+            ) from e
+    except Exception as e:  # noqa: BLE001 - any failure is recorded on the asset
+        state["read_errors"] = 0
+        summary.errors += 1
+        reason = (
+            str(e) if isinstance(e, (decode.DecodeError, _WorkerFailure))
+            else f"{type(e).__name__}: {e}"
+        )
+        _record_error(conn, item.asset_id, reason)
+        prog.say(f"  error: {item.rel_path}: {reason}"[:300])
+    else:
+        state["read_errors"] = 0
+        summary.analyzed += 1
+        if moved_from is not None:
+            summary.moved += 1
+            if item.new_this_run:
+                summary.added -= 1
+            if moved_from in gone_ids:  # it was marked missing earlier in this run
+                summary.missing -= 1
+    prog.tick(summary, item.rel_path)
+    if prog.done % _PROGRESS_EVERY == 0:
+        _save_run(conn, summary, None, None)
+
+
 def _analyze_all(
-    cfg, conn, work, requested, force, summary: RunSummary, prog: _Progress, gone_ids: set[int]
+    cfg, conn, work, requested, force, summary: RunSummary, prog: _Progress, gone_ids: set[int],
+    workers: int | None = None,
 ):
     prog.total = len(work)
     prog.started = time.monotonic()
     versions = stage_versions()
-    read_errors = 0  # consecutive
-    for item in work:
-        try:
-            moved_from = _analyze(cfg, conn, item, requested, force, versions)
-        except KeyboardInterrupt:
-            raise
-        except LibraryReadError as e:
-            if not _root_reachable(cfg):
-                raise LibraryUnavailable(
-                    f"the library root {cfg.library_root} became unreachable during the run "
-                    f"({e}); stopped. Run `foley index` again once the share is back."
-                ) from e
-            read_errors += 1
-            summary.errors += 1
-            _record_error(conn, item.asset_id, str(e), keep_analyzed=True)
-            prog.say(f"  error: {item.rel_path}: {e}"[:300])
-            if read_errors >= MAX_CONSECUTIVE_READ_ERRORS:
-                raise LibraryUnavailable(
-                    f"{read_errors} library reads failed in a row (last: {item.rel_path}: "
-                    f"{e}); stopped. Check the share and run `foley index` again."
-                ) from e
-        except Exception as e:  # noqa: BLE001 - any failure is recorded on the asset
-            read_errors = 0
-            summary.errors += 1
-            reason = str(e) if isinstance(e, decode.DecodeError) else f"{type(e).__name__}: {e}"
-            _record_error(conn, item.asset_id, reason)
-            prog.say(f"  error: {item.rel_path}: {reason}"[:300])
-        else:
-            read_errors = 0
-            summary.analyzed += 1
-            if moved_from is not None:
-                summary.moved += 1
-                if item.new_this_run:
-                    summary.added -= 1
-                if moved_from in gone_ids:  # it was marked missing earlier in this run
-                    summary.missing -= 1
-        prog.tick(summary, item.rel_path)
-        if prog.done % _PROGRESS_EVERY == 0:
-            _save_run(conn, summary, None, None)
+    state = {"read_errors": 0}  # consecutive read failures
+    n_workers = default_workers() if workers is None else max(1, int(workers))
+
+    def serial(item: _Work) -> None:
+        _handle(cfg, conn, item, summary, prog, gone_ids, state,
+                lambda: _analyze(cfg, conn, item, requested, force, versions))
+
+    pooled: list[_Work] = []
+    if n_workers > 1:
+        rows = {
+            r["id"]: r for r in conn.execute(
+                "SELECT id, content_hash, size_bytes FROM assets WHERE status != 'missing'"
+            )
+        }
+        for item in work:
+            row = rows.get(item.asset_id)
+            if row is not None and row["size_bytes"] <= LARGE_FILE_BYTES and (
+                _needs_read(item.needed, row["content_hash"], item.candidate)
+            ):
+                pooled.append(item)
+        if workers is None and len(pooled) <= n_workers:
+            pooled = []  # not worth starting processes for a handful of files
+    if not pooled:
+        for item in work:
+            serial(item)
+    else:
+        pooled_ids = {w.asset_id for w in pooled}
+        rest = [w for w in work if w.asset_id not in pooled_ids]
+        with _single_threaded_children():
+            _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
+                      summary, prog, gone_ids, state, serial)
     elapsed = time.monotonic() - prog.started
     if work:
         prog.say(
             f"analyzed {summary.analyzed} files in {_fmt_duration(elapsed)} "
             f"({len(work) / max(elapsed, 1e-6):.1f} files/s), {summary.errors} errors"
+            + (f", {n_workers} workers" if pooled else "")
         )
+
+
+# ---- parallel analysis --------------------------------------------------------------
+#
+# Workers (spawned processes) only read, hash and compute: they get a picklable _Job and
+# return a small dict (content hash, metadata dict, audio hash, feature/loudness
+# numbers). The main process alone touches SQLite: move resolution, captions, FTS,
+# asset_stages and status, in the same per-file transaction as the serial path
+# (_analyze with a precomputed result). Files over LARGE_FILE_BYTES and files that need
+# no read (caption/fts-only bumps) run in the main process.
+
+# "module:function" called in each worker after start-up. Tests only (fakes, audit hook).
+WORKER_INIT_HOOK: str | None = None
+_WORKER_MOVES: dict = {}
+_MAX_TASKS_PER_CHILD = 500
+_WORKER_START_TIMEOUT = 300  # s; first imports can be slow
+
+
+class _WorkerFailure(Exception):
+    """A worker's non-read failure, already formatted like the serial path's message."""
+
+
+def _worker_init(moves: dict, hook: str | None) -> None:
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # the main process handles Ctrl+C
+    _WORKER_MOVES.clear()
+    _WORKER_MOVES.update(moves)
+    if hook:
+        import importlib
+
+        module, _, func = hook.partition(":")
+        getattr(importlib.import_module(module), func)()
+
+
+def _worker_compute(job: _Job) -> tuple:
+    try:
+        return ("ok", _compute(job, _WORKER_MOVES.get))
+    except LibraryReadError as e:
+        return ("read", str(e))
+    except decode.DecodeError as e:
+        return ("other", str(e))
+    except Exception as e:  # noqa: BLE001 - reported per file, like the serial path
+        return ("other", f"{type(e).__name__}: {e}")
+
+
+def _move_map(conn, requested, force, versions) -> dict:
+    """content_hash of every missing asset -> (stages a move onto it needs, its metadata).
+    Several missing assets with one hash: the union, so a worker computes enough."""
+    done: dict[int, dict[str, str]] = {}
+    for r in conn.execute(
+        "SELECT s.asset_id, s.stage, s.version FROM asset_stages s "
+        "JOIN assets a ON a.id = s.asset_id WHERE a.status = 'missing'"
+    ):
+        done.setdefault(r[0], {})[r[1]] = r[2]
+    out: dict[str, tuple[frozenset, str | None]] = {}
+    for r in conn.execute(
+        "SELECT id, content_hash, source_metadata FROM assets "
+        "WHERE status = 'missing' AND content_hash IS NOT NULL"
+    ):
+        needs = _needs_after_move(done.get(r[0], {}), requested, force, versions)
+        prev = out.get(r[1])
+        out[r[1]] = (needs | prev[0], prev[1]) if prev else (needs, r[2])
+    return out
+
+
+# One math thread per worker: N workers each starting a BLAS/OpenMP/numba thread pool
+# per CPU oversubscribe the machine (measured: 5.5 -> 14.5 files/s with 8 workers).
+# Children read these at start-up, so they are set while the pool exists (replacement
+# workers start later). Values the user set explicitly are kept.
+_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMBA_NUM_THREADS")
+
+
+class _single_threaded_children:
+    def __enter__(self):
+        self.added = [k for k in _THREAD_ENV if k not in os.environ]
+        for k in self.added:
+            os.environ[k] = "1"
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for k in self.added:
+            os.environ.pop(k, None)
+
+
+class _PoolUnavailable(Exception):
+    """Worker processes cannot be started here (or die on start-up)."""
+
+
+def _worker_ping() -> int:
+    return os.getpid()
+
+
+def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
+              summary, prog, gone_ids, state, serial) -> None:
+    import multiprocessing
+    from collections import deque
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+    from concurrent.futures.process import BrokenProcessPool
+
+    moves = _move_map(conn, requested, force, versions)
+
+    def new_pool(size: int) -> ProcessPoolExecutor:
+        """A pool whose workers have proven they start (one ping), else _PoolUnavailable."""
+        last: BaseException | None = None
+        for _ in range(2):
+            pool = ProcessPoolExecutor(
+                max_workers=size, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_worker_init, initargs=(moves, WORKER_INIT_HOOK),
+                max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+            )
+            try:
+                pool.submit(_worker_ping).result(timeout=_WORKER_START_TIMEOUT)
+                return pool
+            except KeyboardInterrupt:
+                _kill_pool(pool)
+                raise
+            except Exception as e:  # noqa: BLE001 - broken pool, timeout, pickling...
+                last = e
+                _kill_pool(pool)
+        raise _PoolUnavailable(f"{type(last).__name__}: {last}")
+
+    def job_for(item: _Work) -> _Job | None:
+        row = conn.execute("SELECT * FROM assets WHERE id=?", (item.asset_id,)).fetchone()
+        return None if row is None else _job(cfg, row, item, requested)
+
+    queue = deque(pooled)
+    suspects: deque = deque()  # in flight when a worker died: retried one at a time
+    inflight: dict = {}
+    main_items = deque(rest)  # no-read and large files: done here between results
+    cap = 2 * n_workers
+    pool = None
+    try:
+        pool = new_pool(n_workers)
+        prog.say(f"analyzing with {n_workers} worker processes")
+        while queue or suspects or inflight or main_items:
+            if suspects:
+                if not inflight:
+                    item = suspects.popleft()
+                    job = job_for(item)
+                    if job is None:
+                        serial(item)
+                        continue
+                    inflight[pool.submit(_worker_compute, job)] = (item, True)
+            else:
+                while queue and len(inflight) < cap:
+                    item = queue.popleft()
+                    job = job_for(item)
+                    if job is None:
+                        serial(item)  # records the "row vanished" error
+                        continue
+                    inflight[pool.submit(_worker_compute, job)] = (item, False)
+            if main_items and not any(f.done() for f in inflight):
+                serial(main_items.popleft())
+                continue
+            if not inflight:
+                continue
+            done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+            broken: list = []
+            for fut in done:
+                item, isolated = inflight.pop(fut)
+                try:
+                    outcome = fut.result()
+                except BrokenProcessPool:
+                    broken.append((item, isolated))
+                    continue
+                _handle(cfg, conn, item, summary, prog, gone_ids, state,
+                        _pooled_step(cfg, conn, item, outcome, requested, force, versions))
+            if broken:
+                broken += list(inflight.values())
+                inflight.clear()
+                _kill_pool(pool)
+                pool = None
+                for item, isolated in broken:
+                    if isolated:  # it crashed alone: it is the culprit
+                        _handle(cfg, conn, item, summary, prog, gone_ids, state,
+                                _raiser(_WorkerFailure(
+                                    "analysis worker process crashed on this file "
+                                    "(out of memory or a decoder crash?)")))
+                    else:
+                        suspects.append(item)
+                pool = new_pool(n_workers)
+    except _PoolUnavailable as e:
+        prog.say(f"worker processes unavailable ({e}); continuing in this process")
+        if pool is not None:
+            _kill_pool(pool)
+        for item in [*(i for i, _ in inflight.values()), *suspects, *queue, *main_items]:
+            serial(item)
+    except BaseException:
+        if pool is not None:
+            _kill_pool(pool)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+
+def _raiser(exc: Exception) -> Callable[[], int | None]:
+    def step() -> int | None:
+        raise exc
+
+    return step
+
+
+def _pooled_step(cfg, conn, item, outcome, requested, force, versions):
+    kind = outcome[0]
+    if kind == "read":
+        return _raiser(LibraryReadError(outcome[1]))
+    if kind == "other":
+        return _raiser(_WorkerFailure(outcome[1]))
+    return lambda: _analyze(cfg, conn, item, requested, force, versions, result=outcome[1])
+
+
+def _kill_pool(pool) -> None:
+    """Stop now (Ctrl+C or an abort): drop queued jobs and end the worker processes."""
+    try:
+        procs = list((getattr(pool, "_processes", None) or {}).values())
+        pool.shutdown(wait=False, cancel_futures=True)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        for p in procs:
+            try:
+                p.join(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _root_reachable(cfg: Config) -> bool:
@@ -781,56 +1069,158 @@ def _metadata_bytes(path: Path) -> bytes:
         return bytes(out)
 
 
-def _analyze(cfg, conn, item: _Work, requested, force, versions) -> int | None:
-    """Analyze one file and commit it. Returns the re-pointed asset id for a move."""
+_CONTENT_STAGES = frozenset({"metadata", *_AUDIO_STAGES})  # need the file's bytes
+
+
+@dataclass(frozen=True)
+class _Job:
+    """Everything needed to analyze one file away from the database (picklable)."""
+
+    asset_id: int
+    rel_path: str
+    path: str
+    ext: str
+    large: bool
+    needed: frozenset
+    requested: tuple
+    candidate: bool
+    stored_hash: str | None
+    stored_metadata: str | None  # source_metadata JSON, for kind_hint when not re-read
+
+
+def _needs_read(needed, content_hash, candidate: bool) -> bool:
+    return bool(set(needed) & _CONTENT_STAGES) or content_hash is None or candidate
+
+
+def _needs_after_move(done: dict, requested, force, versions) -> frozenset:
+    needed = {s for s in requested if force or done.get(s) != versions[s]}
+    return frozenset(needed | (set(_PATH_STAGES) & set(requested)))
+
+
+def _job(cfg, row, item: _Work, requested) -> _Job:
+    return _Job(
+        asset_id=row["id"], rel_path=row["rel_path"], path=str(cfg.abs_path(row["rel_path"])),
+        ext=row["ext"], large=row["size_bytes"] > LARGE_FILE_BYTES,
+        needed=frozenset(item.needed), requested=tuple(requested), candidate=item.candidate,
+        stored_hash=row["content_hash"], stored_metadata=row["source_metadata"],
+    )
+
+
+def _compute(job: _Job, resolve_move: Callable[[str], tuple | None]) -> dict:
+    """Read the file once, hash it, and compute the content stages it needs.
+
+    Runs in a worker process or in the main process; touches no database. Which stages
+    it computes follows the same rules as the commit: a never-analyzed file whose hash
+    matches a missing asset (resolve_move) needs only what that move needs; bytes that
+    changed under an unchanged size/mtime need every requested stage.
+    """
+    path = Path(job.path)
+    needed = set(job.needed)
+    stored_metadata = job.stored_metadata
+    data = None
+    if job.large:  # never hold a huge file in memory next to its decoded audio
+        chash = _read(_stream_hash, path)
+    else:
+        data = _read(decode.read_bytes, path)
+        chash = decode.content_hash(data)
+    move = resolve_move(chash) if job.candidate else None
+    if move is not None:
+        needed, stored_metadata = set(move[0]), move[1]
+    elif job.stored_hash is not None and job.stored_hash != chash:
+        needed = set(job.requested)
+    out: dict = {"content_hash": chash, "computed": []}
+    if "metadata" in needed:
+        head = _read(_metadata_bytes, path) if job.large else data
+        out["metadata"] = scan.read_metadata(head, job.ext, job.rel_path)
+        out["computed"].append("metadata")
+        del head
+        metadata = out["metadata"]
+    else:
+        try:
+            metadata = json.loads(stored_metadata) if stored_metadata else None
+        except ValueError:
+            metadata = None
+    if needed & set(_AUDIO_STAGES):
+        if job.large:
+            audio = _read(decode.decode_path, path)
+        else:
+            audio = decode.decode_bytes(data, job.ext)
+        data = None
+        out["audio_hash"] = decode.audio_hash(audio)
+        if "features" in needed:
+            out["features"] = features.compute_features(
+                audio, scan.kind_hint(job.rel_path, metadata)
+            )
+            out["computed"].append("features")
+        if "loudness" in needed:
+            out["loudness"] = loudness.measure(audio)
+            out["computed"].append("loudness")
+        del audio
+    return out
+
+
+def _live_move_resolver(conn, rel, requested, force, versions):
+    def resolve(chash: str) -> tuple | None:
+        target = _find_move_target(conn, chash, rel)
+        if target is None:
+            return None
+        done = {
+            r[0]: r[1] for r in conn.execute(
+                "SELECT stage, version FROM asset_stages WHERE asset_id=?", (target["id"],)
+            )
+        }
+        return _needs_after_move(done, requested, force, versions), target["source_metadata"]
+
+    return resolve
+
+
+def _analyze(cfg, conn, item: _Work, requested, force, versions,
+             result: dict | None = None) -> int | None:
+    """Analyze one file (or take a worker's `result`) and commit it in one transaction.
+    Returns the re-pointed asset id for a move."""
     row = conn.execute("SELECT * FROM assets WHERE id=?", (item.asset_id,)).fetchone()
     if row is None:
         raise RuntimeError("asset row vanished during the run")
-    needed = set(item.needed)
     rel = row["rel_path"]
     ext = row["ext"]
-    target = None
+    job = _job(cfg, row, item, requested)
+    resolver = _live_move_resolver(conn, rel, requested, force, versions)
+    if result is None and _needs_read(item.needed, row["content_hash"], item.candidate):
+        result = _compute(job, resolver)
 
-    need_bytes = (
-        bool(needed & {"metadata", *_AUDIO_STAGES}) or row["content_hash"] is None
-        or item.candidate
-    )
-    data: bytes | None = None
-    content_changed = False
-    chash = row["content_hash"]
-    path = cfg.abs_path(rel)
-    large = row["size_bytes"] > LARGE_FILE_BYTES
-    if need_bytes:
-        if large:  # never hold a huge file in memory next to its decoded audio
-            chash = _read(_stream_hash, path)
-        else:
-            data = _read(decode.read_bytes, path)
-            chash = decode.content_hash(data)
-        if item.candidate:
-            target = _find_move_target(conn, chash, rel)
-        if target is not None:
-            done = {
-                r[0]: r[1] for r in conn.execute(
-                    "SELECT stage, version FROM asset_stages WHERE asset_id=?", (target["id"],)
-                )
-            }
-            needed = {s for s in requested if force or done.get(s) != versions[s]}
-            needed |= set(_PATH_STAGES) & set(requested)
-        elif row["content_hash"] is not None and row["content_hash"] != chash:
-            needed = set(requested)  # bytes changed without a size/mtime change
-            content_changed = True
+    for _attempt in range(2):
+        needed = set(item.needed)
+        target = None
+        content_changed = False
+        chash = row["content_hash"]
+        if result is not None:
+            chash = result["content_hash"]
+            if item.candidate:
+                target = _find_move_target(conn, chash, rel)
+            if target is not None:
+                done = {
+                    r[0]: r[1] for r in conn.execute(
+                        "SELECT stage, version FROM asset_stages WHERE asset_id=?",
+                        (target["id"],),
+                    )
+                }
+                needed = set(_needs_after_move(done, requested, force, versions))
+            elif row["content_hash"] is not None and row["content_hash"] != chash:
+                needed = set(requested)  # bytes changed without a size/mtime change
+                content_changed = True
+            if (needed & _CONTENT_STAGES) - set(result["computed"]):
+                # a worker planned for a move that an earlier file already took: redo here
+                result = _compute(job, resolver)
+                continue
+        break
     asset_id = target["id"] if target is not None else row["id"]
     base = target if target is not None else row
 
     asset_view = dict(base)
     asset_view.update(rel_path=rel, ext=ext, size_bytes=row["size_bytes"],
                       mtime_ns=row["mtime_ns"], content_hash=chash)
-    metadata_ran = "metadata" in needed
-    if metadata_ran:
-        head = _read(_metadata_bytes, path) if large else data
-        assert head is not None
-        metadata = scan.read_metadata(head, ext, rel)
-        del head
+    if "metadata" in needed:
+        metadata = result["metadata"]
         pack, category = scan.classify_path(cfg, rel)
         asset_view.update(
             pack=pack, category_path=category, license=scan.find_license(cfg, rel),
@@ -850,23 +1240,18 @@ def _analyze(cfg, conn, item: _Work, requested, force, versions) -> int | None:
     new_feats: dict = {}
     ahash = None
     if needed & set(_AUDIO_STAGES):
-        if large:
-            audio = _read(decode.decode_path, path)
-        else:
-            assert data is not None
-            audio = decode.decode_bytes(data, ext)
-        ahash = decode.audio_hash(audio)
+        ahash = result["audio_hash"]
         if "features" in needed:
-            new_feats.update(features.compute_features(audio, scan.kind_hint(rel, metadata)))
+            new_feats.update(result["features"])
         if "loudness" in needed:
-            new_feats.update(loudness.measure(audio))
-        del audio
-    data = None
+            new_feats.update(result["loudness"])
+    result = None
     feats.update({k: v for k, v in new_feats.items() if k in FEATURE_COLUMNS})
 
     caption = None
     if "caption" in needed:
         caption = captions.templated_caption(asset_view, feats, [], metadata)
+
 
     now = db.utcnow()
     with db.transaction(conn):

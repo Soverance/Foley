@@ -36,6 +36,7 @@ def cmd_index(cfg, args) -> int:
             limit=args.limit,
             progress=print,
             allow_mass_missing=args.allow_mass_missing,
+            workers=args.workers,
         )
     except (sync.IndexLocked, sync.LibraryUnavailable, config_mod.ConfigError, ValueError) as e:
         print(f"foley: {e}", file=sys.stderr)
@@ -171,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--stage", action="append", help="only run this stage (repeatable)")
     s.add_argument("--force", action="store_true", help="re-run the stages even if current")
     s.add_argument("--limit", type=int, help="analyze at most N files (trial runs)")
+    s.add_argument(
+        "--workers",
+        type=int,
+        help="analysis processes (default: auto, up to 8; 1 = in-process)",
+    )
     s.add_argument(
         "--allow-mass-missing",
         action="store_true",

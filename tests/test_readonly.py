@@ -111,6 +111,14 @@ def _violation(event: str, target) -> None:
     if _called_from_nas_write():
         return
     _STATE["violations"].append((event, os.fsdecode(target) if target is not None else None))
+    log = os.environ.get("FOLEY_TEST_GUARD_LOG")
+    if log:  # in an analysis worker: tell the test process
+        _STATE["armed"] = False
+        try:
+            with open(Path(log) / f"{os.getpid()}.log", "a", encoding="utf-8") as f:
+                f.write(f"{event} {target!r}\n")
+        finally:
+            _STATE["armed"] = True
     raise PermissionError(f"library write outside nas_write.py: {event} {target!r}")
 
 
@@ -179,15 +187,59 @@ class _GuardedSoundFile(_REAL_SOUNDFILE):
         super().__init__(file, mode, *args, **kwargs)
 
 
-@pytest.fixture
-def guard(library, monkeypatch):
+def _arm(library: Path) -> None:
     global _INSTALLED
     if not _INSTALLED:
         sys.addaudithook(_hook)
         _INSTALLED = True
-    monkeypatch.setattr(sf, "SoundFile", _GuardedSoundFile)
     root = os.path.normcase(os.path.realpath(library))
     _STATE.update(root=root, root_text=os.path.normcase(str(library)), violations=[], armed=True)
+
+
+def _worker_guard() -> None:
+    """sync.WORKER_INIT_HOOK target: the same guard inside each analysis worker."""
+    sf.SoundFile = _GuardedSoundFile
+    _arm(Path(os.environ["FOLEY_TEST_GUARD_ROOT"]))
+
+
+def _try_append(path: str) -> str:
+    try:
+        with open(path, "ab"):
+            pass
+    except PermissionError as e:
+        return f"blocked: {e}"
+    return "written"
+
+
+def _worker_logs(log_dir: Path) -> list[str]:
+    return [line for p in log_dir.glob("*.log") for line in p.read_text().splitlines()]
+
+
+@pytest.fixture
+def worker_guard(library, monkeypatch, tmp_path) -> Path:
+    log_dir = tmp_path / "guard-logs"
+    log_dir.mkdir()
+    monkeypatch.setenv("FOLEY_TEST_GUARD_ROOT", str(library))
+    monkeypatch.setenv("FOLEY_TEST_GUARD_LOG", str(log_dir))
+    monkeypatch.setattr(sync, "WORKER_INIT_HOOK", "test_readonly:_worker_guard")
+    return log_dir
+
+
+def test_guard_works_inside_spawned_workers(worker_guard, library):
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    target = str(library / "sfx" / "click.wav")
+    with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
+                             initializer=_worker_guard) as pool:
+        assert pool.submit(_try_append, target).result().startswith("blocked")
+    assert len(_worker_logs(worker_guard)) == 1
+
+
+@pytest.fixture
+def guard(library, monkeypatch):
+    monkeypatch.setattr(sf, "SoundFile", _GuardedSoundFile)
+    _arm(library)
     try:
         yield _STATE
     finally:
@@ -272,22 +324,25 @@ def _use_real_or_fake(monkeypatch, tmp_path) -> bool:
     return False
 
 
+@pytest.mark.parametrize("workers", [1, 2])
 def test_every_entry_point_leaves_the_library_alone(
-    guard, cfg, library, monkeypatch, tmp_path
+    guard, worker_guard, cfg, library, monkeypatch, tmp_path, workers
 ):
     guard["armed"] = False
     real = _use_real_or_fake(monkeypatch, tmp_path)
+    if workers > 1 and not real:
+        pytest.skip("parallel analysis needs the real pipeline modules (fakes stay in-process)")
     project = tmp_path / "game"
     project.mkdir()
     (project / "project.godot").write_text("")
     before = _snapshot(library)
     guard["armed"] = True
 
-    summary = sync.run_index(cfg)
+    summary = sync.run_index(cfg, workers=workers)
     assert summary.analyzed > 0 and not summary.interrupted
     if real:
         assert summary.errors == 0
-    sync.run_index(cfg, force=True)  # every stage again
+    sync.run_index(cfg, force=True, workers=workers)  # every stage again
     conn = db.open_catalog(cfg)
     try:
         rep = dedupe.report(cfg, conn)
@@ -332,4 +387,5 @@ def test_every_entry_point_leaves_the_library_alone(
 
     guard["armed"] = False
     assert guard["violations"] == []
+    assert _worker_logs(worker_guard) == []
     assert _snapshot(library) == before
