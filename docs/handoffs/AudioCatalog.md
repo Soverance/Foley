@@ -291,7 +291,7 @@ Development and testing run against the current 2,256-file library. The full ind
 Scope: repo scaffold with uv, config, `catalog.db` and `ledger.db` with schema versioning and migrations, library sync, pipeline stages 1–5, FTS5 search, templated captions from metadata and features, CLI (`foley index`, `foley search`, `foley describe`, `foley status`, `foley prune`, `foley dedupe report`), and the MCP tools `search_audio`, `describe`, `render_comparison`, `import_to_project`, `catalog_status`. No PyTorch dependency yet.
 
 - [x] Full library indexes from the NAS share; an interrupted run resumes without redoing finished files *(Oct 14: 2,256 files in 22 min, 0 errors; a 40-file trial run was resumed by the full run)*
-- [ ] Re-running with no library changes skips every file
+- [x] Re-running with no library changes skips every file *(Oct 14: 7,917 files scanned in 3.4 s, 0 analyzed)*
 - [x] On a generated fixture library, sync correctly handles added, changed, moved, deleted, still-being-written and undecodable files, and archives
 - [x] LUFS values agree with ffmpeg's `ebur128` filter within 0.5 LU on 10 sample files *(13 library files: within 0.07 LU, true peak within 0.06 dB)*
 - [x] `render_comparison` produces a grid Claude Code can read and correctly describe (silence, tail length, brightness)
