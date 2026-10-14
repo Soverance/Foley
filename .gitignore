@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local configuration and data (never commit a real library's catalog or test set)
+foley.toml
+foley.project.toml
+testset.toml
+*.db
+*.db-wal
+*.db-shm
+*.lock
+
+# Audio and renders belong in the library and the local cache, not the repo
+*.wav
+*.WAV
+*.flac
+*.ogg
+*.mp3
+*.png
+!docs/**/*.png

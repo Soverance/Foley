@@ -1,0 +1,982 @@
+"""`foley index`: incremental, resumable, idempotent library sync and analysis.
+
+CONTRACT:
+
+    STAGES = ("metadata", "features", "loudness", "caption", "fts")   # Phase 1a
+        Each has a version (scan.METADATA_VERSION, features.FEATURES_VERSION,
+        loudness.LOUDNESS_VERSION, captions.CAPTION_VERSION, search.FTS_VERSION).
+        A stage runs for an asset when asset_stages lacks it or its version differs.
+        All stages needing audio share one read_bytes + decode per file.
+        (Files over LARGE_FILE_BYTES: streamed hash + decode.decode_path instead.)
+
+    @dataclass RunSummary: run_id, scanned, added, changed, moved, missing, analyzed,
+                           errors, settling, archives, interrupted: bool
+
+    run_index(cfg, stages: list[str] | None = None, force: bool = False,
+              limit: int | None = None, progress: Callable[[str], None] | None = None,
+              allow_mass_missing: bool = False) -> RunSummary
+        Implements "Library sync" in docs/handoffs/AudioCatalog.md exactly:
+        lock file (IndexLocked if held by a live process; stale locks recovered),
+        index_runs row, scan, diff by (rel_path, size, mtime_ns), settle window,
+        move detection by content hash against `missing` assets, missing marking,
+        archives table, per-file commit, retry of `error` assets, Ctrl+C marks the
+        run interrupted and the next run resumes. `stages` limits which stages run
+        (re-run those even if current when force=True). `limit` caps files analyzed
+        (for trial runs).
+        Raises LibraryUnavailable (run recorded as 'failed', nothing marked missing)
+        when the root cannot be listed, when the scan would mark more than
+        MASS_MISSING_FRACTION (10%) of active assets and at least MASS_MISSING_MIN (50)
+        files missing (or every file) unless allow_mass_missing=True, and when the root
+        becomes unreachable or MAX_CONSECUTIVE_READ_ERRORS reads fail in a row during
+        analysis. A failed read of a file that was analyzed before records the error
+        text/count but keeps the asset's status (it stays searchable).
+
+    prune(cfg, dry_run: bool = True) -> list[str]
+        rel_paths of `missing` assets older than prune_missing_days with no ledger
+        rows (by content_hash); deletes their catalog rows and cached images unless
+        dry_run. Never touches the library.
+
+    class IndexLocked(Exception)
+    class LibraryUnavailable(RuntimeError)
+
+Implementation notes (not contract):
+  * The diff is done in memory against one query of `assets` and one of
+    `asset_stages`; only files that need work cost a NAS read.
+  * New paths get a provisional `pending` row during the diff. Their first hashing
+    (part of analysis, so each file is read once) checks for a `missing` asset with
+    the same content_hash; on a match the provisional row is deleted and the missing
+    asset is re-pointed to the new path in the same transaction that stores the
+    analysis, keeping its id, stages and analysis. Path-derived stages (metadata,
+    caption, fts) re-run for it; features and loudness do not.
+  * Each file's results, stage records and status change commit in one transaction,
+    so a crash or Ctrl+C mid-file leaves that asset exactly as it was (pending).
+  * An asset becomes `active` once every stage in STAGES is current.
+  * Paths under a directory that could not be listed are never marked missing.
+  * prune(dry_run=False) takes the index lock and raises IndexLocked if an index runs.
+  * The lock is an OS-level lock on data_dir/index.lock held for the whole run (see
+    the lock section); it frees itself if the process dies.
+  * If a file's bytes changed without a size/mtime change, all its stage records are
+    dropped so every stage re-runs (now or on the next full run).
+"""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import socket
+import struct
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import xxhash
+
+from foley import captions, decode, features, loudness, scan, search
+from foley.catalog import db
+from foley.config import Config, check_data_dir
+
+STAGES = ("metadata", "features", "loudness", "caption", "fts")
+
+# Stages whose output depends on the path (re-run when an asset is moved).
+_PATH_STAGES = ("metadata", "caption", "fts")
+_AUDIO_STAGES = ("features", "loudness")
+_PROGRESS_EVERY = 50
+
+# Files above this size are hashed by streaming and decoded with decode.decode_path, so
+# their raw bytes and decoded audio are never in memory together (a second read is fine
+# for these rare files). Metadata then comes from the header/chunks only.
+LARGE_FILE_BYTES = 512 * 1024 * 1024
+_HASH_BLOCK = 8 * 1024 * 1024
+_MAX_META_CHUNK = 16 * 1024 * 1024
+_NON_RIFF_HEAD = 4 * 1024 * 1024
+
+# Safety valves against a share that drops or half-mounts mid-run.
+MASS_MISSING_FRACTION = 0.10
+MASS_MISSING_MIN = 50
+MAX_CONSECUTIVE_READ_ERRORS = 20
+
+FEATURE_COLUMNS = (
+    "duration_s", "sample_rate", "channels", "lufs_integrated", "lufs_short_max",
+    "true_peak_db", "lead_silence_s", "tail_silence_s", "attack_s", "decay_s",
+    "onset_count", "centroid_hz_mean", "rolloff_hz_mean", "flatness_mean", "zcr_mean",
+    "band_energy", "tempo_bpm", "loop_seam_score", "is_music",
+)
+
+
+class IndexLocked(Exception):
+    pass
+
+
+class LibraryUnavailable(RuntimeError):
+    """The library (or too much of it) is not visible, so the run stops before it
+    marks files missing or records read failures that are not the files' fault."""
+
+
+class LibraryReadError(Exception):
+    """Reading a library file failed with an OSError (share/IO trouble, not decoding)."""
+
+
+def _read(fn, *args):
+    try:
+        return fn(*args)
+    except OSError as e:
+        raise LibraryReadError(f"read failed: {type(e).__name__}: {e}") from e
+
+
+@dataclass
+class RunSummary:
+    run_id: int
+    scanned: int = 0
+    added: int = 0
+    changed: int = 0
+    moved: int = 0
+    missing: int = 0
+    analyzed: int = 0
+    errors: int = 0
+    settling: int = 0
+    archives: int = 0
+    interrupted: bool = False
+
+
+def stage_versions() -> dict[str, str]:
+    """Current version of every stage (read at call time so upgrades are picked up)."""
+    return {
+        "metadata": scan.METADATA_VERSION,
+        "features": features.FEATURES_VERSION,
+        "loudness": loudness.LOUDNESS_VERSION,
+        "caption": captions.CAPTION_VERSION,
+        "fts": search.FTS_VERSION,
+    }
+
+
+# --------------------------------------------------------------------------- lock
+#
+# The lock is an OS-level exclusive lock (msvcrt.locking on Windows, fcntl.flock
+# elsewhere) held on data_dir/index.lock for the whole run. The OS drops it when the
+# holder exits or crashes, so a stale lock needs no detection and two runs can never
+# both take it over. The file's JSON (pid, start time, host) is informational, for the
+# "already running" message. The file is never deleted (deleting it would let a new
+# run lock a fresh inode while an old one still holds the unlinked one); an empty
+# file means nobody holds it. If the platform/filesystem cannot lock files, a
+# pid-liveness check is the fallback.
+
+_PROCESS_SEEN_AT = time.time()  # no lock written by this process predates this
+_LOCK_OFFSET = 1 << 30  # Windows byte-range locks are mandatory: lock far past the JSON
+
+
+def _pid_alive(pid: int, since: float | None = None) -> bool:
+    """True if `pid` is a running process that started no later than `since` (when known),
+    i.e. plausibly the process that wrote a lock at time `since`."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        # Our own pid: the lock is ours only if written after this process started.
+        return since is None or since >= _PROCESS_SEEN_AT - 1
+    if sys.platform == "win32":
+        return _pid_alive_windows(pid, since)
+    try:
+        os.kill(pid, 0)  # signal 0: existence check only (POSIX)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_alive_windows(pid: int, since: float | None) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (
+        ctypes.POINTER(wintypes.FILETIME),
+    ) * 4
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() == 5  # access denied: it exists
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+            return False  # 259 = STILL_ACTIVE
+        if since is not None:
+            created, t1, t2, t3 = (wintypes.FILETIME() for _ in range(4))
+            if kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(t1), ctypes.byref(t2),
+                ctypes.byref(t3)
+            ):
+                ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                created_unix = ticks / 1e7 - 11644473600
+                if created_unix > since + 5:
+                    return False  # the pid was reused by a newer process
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _read_lock(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+class _LockUnsupported(Exception):
+    pass
+
+
+def _os_lock(fd: int) -> bool:
+    """Try to take the OS lock without blocking. False if another holder has it."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLOCK", -1),
+                       errno.EDEADLK):
+            return False
+        raise _LockUnsupported(str(e)) from e
+
+
+def _os_unlock(fd: int) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass  # closing the descriptor releases it anyway
+
+
+def _locked_message(path: Path, held: dict | None) -> str:
+    if not held:
+        return f"another `foley index` holds {path}; wait for it to finish"
+    return (
+        f"another `foley index` is running (pid {held.get('pid')} on "
+        f"{held.get('host', 'this machine')}, started {held.get('started_at')}). "
+        "Wait for it to finish; the lock frees itself when that process exits."
+    )
+
+
+def _write_info(fd: int, info: dict) -> None:
+    payload = json.dumps(info).encode("utf-8")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, payload)
+    os.ftruncate(fd, len(payload))
+    os.fsync(fd)
+
+
+def _acquire_lock(cfg: Config) -> dict:
+    cfg.ensure_dirs()
+    path = cfg.lock_path
+    info = {
+        "pid": os.getpid(),
+        "started_at": db.utcnow(),
+        "started_ts": time.time(),
+        "host": socket.gethostname(),
+    }
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+    try:
+        try:
+            got = _os_lock(fd)
+        except _LockUnsupported:
+            # No OS locking here: fall back to the pid recorded in the file.
+            held = _read_lock(path)
+            if held and held.get("host") in (None, info["host"]) and _pid_alive(
+                int(held.get("pid") or 0), held.get("started_ts")
+            ):
+                raise IndexLocked(_locked_message(path, held)) from None
+            got = True
+            info["os_lock"] = False
+        if not got:
+            raise IndexLocked(_locked_message(path, _read_lock(path)))
+        held = _read_lock(path)
+        if (
+            held and held.get("pid") != info["pid"]
+            and held.get("host") in (None, info["host"])
+            and _pid_alive(int(held.get("pid") or 0), held.get("started_ts"))
+        ):
+            # A live process wrote this lock without an OS lock: an older Foley build
+            # (pid-file lock only) is still running.
+            raise IndexLocked(_locked_message(path, held))
+        _write_info(fd, {k: v for k, v in info.items() if k != "os_lock"})
+    except BaseException:
+        os.close(fd)
+        raise
+    info["_fd"] = fd
+    return info
+
+
+def _release_lock(cfg: Config, info: dict) -> None:
+    fd = info.pop("_fd", None)
+    if fd is None:
+        return
+    try:
+        os.ftruncate(fd, 0)  # empty file = not held
+    except OSError:
+        pass
+    if info.get("os_lock", True):
+        _os_unlock(fd)
+    os.close(fd)
+
+
+# --------------------------------------------------------------------------- run
+
+
+@dataclass
+class _Work:
+    asset_id: int
+    rel_path: str
+    needed: set[str]
+    candidate: bool  # never analyzed: may turn out to be a moved file
+    new_this_run: bool = False
+
+
+@dataclass
+class _Progress:
+    callback: Callable[[str], None] | None
+    total: int = 0
+    done: int = 0
+    started: float = field(default_factory=time.monotonic)
+
+    def say(self, line: str) -> None:
+        if self.callback:
+            self.callback(line)
+
+    def tick(self, summary: RunSummary, rel_path: str) -> None:
+        self.done += 1
+        if not self.callback or self.done % _PROGRESS_EVERY:
+            return
+        elapsed = max(time.monotonic() - self.started, 1e-6)
+        rate = self.done / elapsed
+        remaining = self.total - self.done
+        eta = _fmt_duration(remaining / rate) if rate > 0 else "?"
+        self.say(
+            f"  [{self.done}/{self.total}] {rate:.1f} files/s, ETA {eta}, "
+            f"errors {summary.errors}  ({rel_path})"
+        )
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _under(rel_path: str, dirs: list[str]) -> bool:
+    return any(rel_path == d or rel_path.startswith(d + "/") for d in dirs)
+
+
+def run_index(
+    cfg: Config,
+    stages: list[str] | None = None,
+    force: bool = False,
+    limit: int | None = None,
+    progress: Callable[[str], None] | None = None,
+    allow_mass_missing: bool = False,
+) -> RunSummary:
+    requested = list(dict.fromkeys(stages)) if stages else list(STAGES)
+    unknown = [s for s in requested if s not in STAGES]
+    if unknown:
+        raise ValueError(f"unknown stage(s) {unknown}; valid stages: {', '.join(STAGES)}")
+
+    check_data_dir(cfg)
+    lock = _acquire_lock(cfg)
+    try:
+        conn = db.open_catalog(cfg)
+        try:
+            return _run(
+                cfg, conn, requested, force, limit, _Progress(progress), allow_mass_missing
+            )
+        finally:
+            conn.close()
+    finally:
+        _release_lock(cfg, lock)
+
+
+def _run(cfg, conn, requested, force, limit, prog: _Progress, allow_mass_missing=False):
+    with db.transaction(conn):
+        # We hold the lock, so any run still marked 'running' died without finishing.
+        conn.execute(
+            "UPDATE index_runs SET status = 'interrupted', "
+            "note = coalesce(note, 'process ended without finishing') WHERE status = 'running'"
+        )
+        cur = conn.execute(
+            "INSERT INTO index_runs(started_at, status, stages) VALUES (?, 'running', ?)",
+            (db.utcnow(), json.dumps(requested)),
+        )
+    summary = RunSummary(run_id=cur.lastrowid)
+    status, note = "failed", None
+    try:
+        work, scan_errors, gone_ids = _sync(
+            cfg, conn, summary, requested, force, prog, allow_mass_missing
+        )
+        if scan_errors:
+            note = json.dumps({"scan_errors": scan_errors[:50]})
+        if limit is not None:
+            work = work[: max(limit, 0)]
+        _analyze_all(cfg, conn, work, requested, force, summary, prog, gone_ids)
+        status = "completed"
+    except KeyboardInterrupt:
+        summary.interrupted = True
+        status = "interrupted"
+        prog.say("interrupted; run `foley index` again to resume")
+    except BaseException as e:
+        note = f"{type(e).__name__}: {e}"[:1000]
+        raise
+    finally:
+        _save_run(conn, summary, status, note)
+    return summary
+
+
+def _save_run(conn, summary: RunSummary, status: str | None, note: str | None) -> None:
+    conn.execute(
+        "UPDATE index_runs SET scanned=?, added=?, changed=?, moved=?, missing=?, "
+        "analyzed=?, errors=?, settling=?, archives=?, status=coalesce(?, status), "
+        "finished_at=CASE WHEN ? IS NULL THEN finished_at ELSE ? END, "
+        "note=coalesce(?, note) WHERE id=?",
+        (summary.scanned, summary.added, summary.changed, summary.moved, summary.missing,
+         summary.analyzed, summary.errors, summary.settling, summary.archives,
+         status, status, db.utcnow(), note, summary.run_id),
+    )
+
+
+def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
+          allow_mass_missing: bool = False):
+    """Scan, diff and record path-level changes. Returns (work list, scan errors)."""
+    t0 = time.monotonic()
+    prog.say(f"scanning {cfg.library_root} ...")
+    result = scan.scan_library(cfg)
+    summary.scanned = len(result.audio)
+    summary.archives = len(result.archives)
+    error_dirs = [p for p, _ in result.errors]
+    for rel, reason in result.errors[:20]:
+        prog.say(f"  error: {rel}: {reason}")
+    if "." in error_dirs:
+        raise LibraryUnavailable(f"cannot list the library root {cfg.library_root}")
+    summary.errors += len(result.errors)
+
+    rows = conn.execute(
+        "SELECT id, rel_path, size_bytes, mtime_ns, content_hash, status, indexed_at "
+        "FROM assets"
+    ).fetchall()
+    by_path = {r["rel_path"]: r for r in rows}
+    stage_map: dict[int, dict[str, str]] = {}
+    for r in conn.execute("SELECT asset_id, stage, version FROM asset_stages"):
+        stage_map.setdefault(r[0], {})[r[1]] = r[2]
+    if not result.audio and not allow_mass_missing and any(
+        r["status"] != "missing" for r in rows
+    ):
+        raise LibraryUnavailable(
+            f"{cfg.library_root} lists no audio files but the catalog has "
+            f"{sum(r['status'] != 'missing' for r in rows)}; refusing to mark everything "
+            "missing (is the share mounted?). If the files really are gone, run "
+            "`foley index --allow-mass-missing`."
+        )
+
+    versions = stage_versions()
+    now = db.utcnow()
+    now_ns = time.time_ns()
+    settle_ns = int(cfg.settle_minutes * 60 * 1e9)
+    day_ns = 86_400 * 10**9
+
+    def settling(f: scan.ScannedFile) -> bool:
+        age = now_ns - f.mtime_ns
+        return (0 <= age < settle_ns) or (-day_ns < age < 0)
+
+    present = {f.rel_path for f in result.audio}
+    new_files, changed, reappeared, seen_ids = [], [], [], []
+    for f in result.audio:
+        row = by_path.get(f.rel_path)
+        if settling(f):
+            summary.settling += 1
+            if row is not None:
+                seen_ids.append(row["id"])
+            continue
+        if row is None:
+            new_files.append(f)
+            continue
+        seen_ids.append(row["id"])
+        if row["size_bytes"] != f.size_bytes or row["mtime_ns"] != f.mtime_ns:
+            changed.append((row, f))
+        elif row["status"] == "missing":
+            reappeared.append(row)
+    gone = [
+        r for p, r in by_path.items()
+        if p not in present and r["status"] != "missing" and not _under(p, error_dirs)
+    ]
+    active = sum(r["status"] == "active" for r in rows)
+    if (not allow_mass_missing and len(gone) >= MASS_MISSING_MIN
+            and len(gone) > MASS_MISSING_FRACTION * active):
+        raise LibraryUnavailable(
+            f"this scan would mark {len(gone)} of {active} active files missing "
+            f"(more than {MASS_MISSING_FRACTION:.0%}); refusing in case the share is only "
+            "partly visible. Nothing was changed. If the files really were removed or "
+            "moved, run `foley index --allow-mass-missing`."
+        )
+
+    def all_current(asset_id: int) -> bool:
+        done = stage_map.get(asset_id, {})
+        return all(done.get(s) == versions[s] for s in STAGES)
+
+    work: list[_Work] = []
+    with db.transaction(conn):
+        for f in new_files:
+            pack, category = scan.classify_path(cfg, f.rel_path)
+            cur = conn.execute(
+                "INSERT INTO assets(rel_path, pack, category_path, ext, size_bytes, mtime_ns, "
+                "first_seen, last_seen, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (f.rel_path, pack, category, f.ext, f.size_bytes, f.mtime_ns, now, now),
+            )
+            work.append(_Work(cur.lastrowid, f.rel_path, set(requested), True, True))
+        for row, f in changed:
+            conn.execute(
+                "UPDATE assets SET size_bytes=?, mtime_ns=?, ext=?, content_hash=NULL, "
+                "audio_hash=NULL, status='pending', missing_since=NULL, error=NULL, "
+                "error_count=0 WHERE id=?",
+                (f.size_bytes, f.mtime_ns, f.ext, row["id"]),
+            )
+            conn.execute("DELETE FROM asset_stages WHERE asset_id=?", (row["id"],))
+            stage_map.pop(row["id"], None)
+        for row in reappeared:
+            conn.execute(
+                "UPDATE assets SET status=?, missing_since=NULL WHERE id=?",
+                ("active" if all_current(row["id"]) else "pending", row["id"]),
+            )
+        conn.executemany(
+            "UPDATE assets SET status='missing', missing_since=? WHERE id=?",
+            [(now, r["id"]) for r in gone],
+        )
+        conn.executemany("UPDATE assets SET last_seen=? WHERE id=?", [(now, i) for i in seen_ids])
+        # archives: mirror what the scan saw (keep rows under unreadable folders)
+        archive_paths = {a.rel_path for a in result.archives}
+        for (old,) in conn.execute("SELECT rel_path FROM archives").fetchall():
+            if old not in archive_paths and not _under(old, error_dirs):
+                conn.execute("DELETE FROM archives WHERE rel_path=?", (old,))
+        conn.executemany(
+            "INSERT INTO archives(rel_path, size_bytes, last_seen) VALUES (?, ?, ?) "
+            "ON CONFLICT(rel_path) DO UPDATE SET size_bytes=excluded.size_bytes, "
+            "last_seen=excluded.last_seen",
+            [(a.rel_path, a.size_bytes, now) for a in result.archives],
+        )
+    summary.added = len(new_files)
+    summary.changed = len(changed)
+    summary.missing = len(gone)
+
+    changed_ids = {row["id"] for row, _ in changed}
+    reappeared_ids = {row["id"] for row in reappeared}
+    gone_ids = {r["id"] for r in gone}
+    for f in result.audio:
+        row = by_path.get(f.rel_path)
+        if row is None or settling(f) or row["id"] in gone_ids:
+            continue
+        aid = row["id"]
+        if aid in changed_ids:
+            work.append(_Work(aid, f.rel_path, set(requested), False))
+            continue
+        done = stage_map.get(aid, {})
+        needed = {s for s in requested if force or done.get(s) != versions[s]}
+        status = "pending" if aid in reappeared_ids else row["status"]
+        if needed:
+            candidate = row["content_hash"] is None and row["indexed_at"] is None and not done
+            work.append(_Work(aid, f.rel_path, needed, candidate))
+        elif status in ("pending", "error") and all_current(aid):
+            conn.execute(
+                "UPDATE assets SET status='active', error=NULL, "
+                "indexed_at=coalesce(indexed_at, ?) WHERE id=?", (now, aid)
+            )
+    work.sort(key=lambda w: w.rel_path)
+    prog.say(
+        f"scanned {summary.scanned} audio files in {time.monotonic() - t0:.1f}s: "
+        f"{summary.added} new, {summary.changed} changed, {summary.missing} missing, "
+        f"{summary.settling} settling, {summary.archives} archives; "
+        f"{len(work)} to analyze"
+    )
+    return work, result.errors, gone_ids
+
+
+def _analyze_all(
+    cfg, conn, work, requested, force, summary: RunSummary, prog: _Progress, gone_ids: set[int]
+):
+    prog.total = len(work)
+    prog.started = time.monotonic()
+    versions = stage_versions()
+    read_errors = 0  # consecutive
+    for item in work:
+        try:
+            moved_from = _analyze(cfg, conn, item, requested, force, versions)
+        except KeyboardInterrupt:
+            raise
+        except LibraryReadError as e:
+            if not _root_reachable(cfg):
+                raise LibraryUnavailable(
+                    f"the library root {cfg.library_root} became unreachable during the run "
+                    f"({e}); stopped. Run `foley index` again once the share is back."
+                ) from e
+            read_errors += 1
+            summary.errors += 1
+            _record_error(conn, item.asset_id, str(e), keep_analyzed=True)
+            prog.say(f"  error: {item.rel_path}: {e}"[:300])
+            if read_errors >= MAX_CONSECUTIVE_READ_ERRORS:
+                raise LibraryUnavailable(
+                    f"{read_errors} library reads failed in a row (last: {item.rel_path}: "
+                    f"{e}); stopped. Check the share and run `foley index` again."
+                ) from e
+        except Exception as e:  # noqa: BLE001 - any failure is recorded on the asset
+            read_errors = 0
+            summary.errors += 1
+            reason = str(e) if isinstance(e, decode.DecodeError) else f"{type(e).__name__}: {e}"
+            _record_error(conn, item.asset_id, reason)
+            prog.say(f"  error: {item.rel_path}: {reason}"[:300])
+        else:
+            read_errors = 0
+            summary.analyzed += 1
+            if moved_from is not None:
+                summary.moved += 1
+                if item.new_this_run:
+                    summary.added -= 1
+                if moved_from in gone_ids:  # it was marked missing earlier in this run
+                    summary.missing -= 1
+        prog.tick(summary, item.rel_path)
+        if prog.done % _PROGRESS_EVERY == 0:
+            _save_run(conn, summary, None, None)
+    elapsed = time.monotonic() - prog.started
+    if work:
+        prog.say(
+            f"analyzed {summary.analyzed} files in {_fmt_duration(elapsed)} "
+            f"({len(work) / max(elapsed, 1e-6):.1f} files/s), {summary.errors} errors"
+        )
+
+
+def _root_reachable(cfg: Config) -> bool:
+    try:
+        with os.scandir(cfg.library_root) as it:
+            next(it, None)
+        return True
+    except OSError:
+        return False
+
+
+def _record_error(conn, asset_id: int, reason: str, keep_analyzed: bool = False) -> None:
+    """Record a failure. With keep_analyzed (I/O errors), an asset analyzed before keeps
+    its status so a flaky share does not pull good files out of search."""
+    status_sql = (
+        "CASE WHEN indexed_at IS NOT NULL THEN status ELSE 'error' END"
+        if keep_analyzed else "'error'"
+    )
+    with db.transaction(conn):
+        conn.execute(
+            f"UPDATE assets SET status={status_sql}, error=?, error_count=error_count+1 "
+            "WHERE id=?",
+            (reason[:1000], asset_id),
+        )
+
+
+def _find_move_target(conn, content_hash: str, rel_path: str):
+    rows = conn.execute(
+        "SELECT * FROM assets WHERE content_hash=? AND status='missing'", (content_hash,)
+    ).fetchall()
+    if not rows:
+        return None
+    name = rel_path.rsplit("/", 1)[-1].casefold()
+
+    def key(r):
+        same_name = r["rel_path"].rsplit("/", 1)[-1].casefold() == name
+        return (not same_name, "" if r["missing_since"] is None else _neg(r["missing_since"]),
+                r["id"])
+
+    return min(rows, key=key)
+
+
+def _neg(text: str) -> str:
+    # sort most recently missing first
+    return "".join(chr(0x10FFFF - ord(c)) for c in text)
+
+
+def _load_features(conn, asset_id: int) -> dict:
+    row = conn.execute("SELECT * FROM features WHERE asset_id=?", (asset_id,)).fetchone()
+    if row is None:
+        return {}
+    out = {k: row[k] for k in FEATURE_COLUMNS}
+    if isinstance(out.get("band_energy"), str):
+        try:
+            out["band_energy"] = json.loads(out["band_energy"])
+        except ValueError:
+            out["band_energy"] = None
+    return out
+
+
+def _stream_hash(path: Path) -> str:
+    """Same digest as decode.content_hash(read_bytes(path)), without holding the file."""
+    h = xxhash.xxh3_128()
+    with open(path, "rb") as f:
+        while block := f.read(_HASH_BLOCK):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _metadata_bytes(path: Path) -> bytes:
+    """A small stand-in for a large file that read_metadata parses the same way: for
+    RIFF/RF64 every chunk except the audio (`data` emitted empty), else the file head."""
+    with open(path, "rb") as f:
+        head = f.read(12)
+        if head[:4] not in (b"RIFF", b"RF64", b"BW64") or len(head) < 12:
+            return head + f.read(_NON_RIFF_HEAD)
+        out = bytearray(b"RIFF" + bytes(4) + head[8:12])
+        pos, ds64_data, count = 12, None, 0
+        total = os.fstat(f.fileno()).st_size
+
+        def read8(at: int) -> bytes:
+            f.seek(at)
+            return f.read(8)
+
+        while count < 10000:
+            count += 1
+            f.seek(pos)
+            hdr = f.read(8)
+            if len(hdr) < 8 or not all(0x20 <= b <= 0x7E for b in hdr[:4]):
+                break
+            cid = hdr[:4]
+            (size,) = struct.unpack("<I", hdr[4:])
+            if cid == b"data":
+                if size == 0xFFFFFFFF and ds64_data is not None:
+                    size = ds64_data
+                out += b"data" + struct.pack("<I", 0)
+            elif cid == b"ds64":
+                body = f.read(min(size, 64))
+                if len(body) >= 16:
+                    ds64_data = struct.unpack_from("<Q", body, 8)[0]
+            else:
+                body = f.read(min(size, _MAX_META_CHUNK))
+                pad = b"\x00" if len(body) % 2 else b""
+                out += cid + struct.pack("<I", len(body)) + body + pad
+            pos = scan.riff_next_offset(read8, pos, size, total)
+        struct.pack_into("<I", out, 4, len(out) - 8)
+        return bytes(out)
+
+
+def _analyze(cfg, conn, item: _Work, requested, force, versions) -> int | None:
+    """Analyze one file and commit it. Returns the re-pointed asset id for a move."""
+    row = conn.execute("SELECT * FROM assets WHERE id=?", (item.asset_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("asset row vanished during the run")
+    needed = set(item.needed)
+    rel = row["rel_path"]
+    ext = row["ext"]
+    target = None
+
+    need_bytes = (
+        bool(needed & {"metadata", *_AUDIO_STAGES}) or row["content_hash"] is None
+        or item.candidate
+    )
+    data: bytes | None = None
+    content_changed = False
+    chash = row["content_hash"]
+    path = cfg.abs_path(rel)
+    large = row["size_bytes"] > LARGE_FILE_BYTES
+    if need_bytes:
+        if large:  # never hold a huge file in memory next to its decoded audio
+            chash = _read(_stream_hash, path)
+        else:
+            data = _read(decode.read_bytes, path)
+            chash = decode.content_hash(data)
+        if item.candidate:
+            target = _find_move_target(conn, chash, rel)
+        if target is not None:
+            done = {
+                r[0]: r[1] for r in conn.execute(
+                    "SELECT stage, version FROM asset_stages WHERE asset_id=?", (target["id"],)
+                )
+            }
+            needed = {s for s in requested if force or done.get(s) != versions[s]}
+            needed |= set(_PATH_STAGES) & set(requested)
+        elif row["content_hash"] is not None and row["content_hash"] != chash:
+            needed = set(requested)  # bytes changed without a size/mtime change
+            content_changed = True
+    asset_id = target["id"] if target is not None else row["id"]
+    base = target if target is not None else row
+
+    asset_view = dict(base)
+    asset_view.update(rel_path=rel, ext=ext, size_bytes=row["size_bytes"],
+                      mtime_ns=row["mtime_ns"], content_hash=chash)
+    metadata_ran = "metadata" in needed
+    if metadata_ran:
+        head = _read(_metadata_bytes, path) if large else data
+        assert head is not None
+        metadata = scan.read_metadata(head, ext, rel)
+        del head
+        pack, category = scan.classify_path(cfg, rel)
+        asset_view.update(
+            pack=pack, category_path=category, license=scan.find_license(cfg, rel),
+            source_metadata=json.dumps(metadata, ensure_ascii=False),
+        )
+    else:
+        try:
+            metadata = json.loads(base["source_metadata"]) if base["source_metadata"] else None
+        except ValueError:
+            metadata = None
+        if target is not None:  # path-derived columns follow the new path regardless
+            pack, category = scan.classify_path(cfg, rel)
+            asset_view.update(pack=pack, category_path=category,
+                              license=scan.find_license(cfg, rel))
+
+    feats = _load_features(conn, asset_id)
+    new_feats: dict = {}
+    ahash = None
+    if needed & set(_AUDIO_STAGES):
+        if large:
+            audio = _read(decode.decode_path, path)
+        else:
+            assert data is not None
+            audio = decode.decode_bytes(data, ext)
+        ahash = decode.audio_hash(audio)
+        if "features" in needed:
+            new_feats.update(features.compute_features(audio, scan.kind_hint(rel, metadata)))
+        if "loudness" in needed:
+            new_feats.update(loudness.measure(audio))
+        del audio
+    data = None
+    feats.update({k: v for k, v in new_feats.items() if k in FEATURE_COLUMNS})
+
+    caption = None
+    if "caption" in needed:
+        caption = captions.templated_caption(asset_view, feats, [], metadata)
+
+    now = db.utcnow()
+    with db.transaction(conn):
+        if target is not None:
+            conn.execute("DELETE FROM assets WHERE id=?", (row["id"],))
+            conn.execute("DELETE FROM search_fts WHERE rowid=?", (row["id"],))
+            # path-derived stages not re-run now (a --stage subset) become stale
+            conn.executemany(
+                "DELETE FROM asset_stages WHERE asset_id=? AND stage=?",
+                [(asset_id, s) for s in _PATH_STAGES if s not in needed],
+            )
+        if content_changed:
+            # Every stage's output describes the old bytes: drop them all, so stages not
+            # requested in this run are redone later instead of looking current.
+            conn.execute("DELETE FROM asset_stages WHERE asset_id=?", (asset_id,))
+            if ahash is None:
+                conn.execute("UPDATE assets SET audio_hash=NULL WHERE id=?", (asset_id,))
+        conn.execute(
+            "UPDATE assets SET rel_path=?, pack=?, category_path=?, ext=?, size_bytes=?, "
+            "mtime_ns=?, content_hash=?, audio_hash=coalesce(?, audio_hash), license=?, "
+            "source_metadata=?, last_seen=?, missing_since=NULL WHERE id=?",
+            (rel, asset_view.get("pack"), asset_view.get("category_path"), ext,
+             row["size_bytes"], row["mtime_ns"], chash, ahash, asset_view.get("license"),
+             asset_view.get("source_metadata"), now, asset_id),
+        )
+        if new_feats:
+            values = dict(feats)
+            if isinstance(values.get("band_energy"), dict):
+                values["band_energy"] = json.dumps(values["band_energy"])
+            cols = ("asset_id",) + FEATURE_COLUMNS
+            conn.execute(
+                f"INSERT OR REPLACE INTO features({', '.join(cols)}) "
+                f"VALUES ({', '.join('?' * len(cols))})",
+                (asset_id, *(values.get(c) for c in FEATURE_COLUMNS)),
+            )
+        if caption is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO captions(asset_id, model, text) VALUES (?, ?, ?)",
+                (asset_id, captions.CAPTION_MODEL, caption),
+            )
+        done_now = [s for s in STAGES if s in needed and s != "fts"]
+        if "fts" in needed:
+            search.index_asset(conn, asset_id)
+            done_now.append("fts")
+        conn.executemany(
+            "INSERT OR REPLACE INTO asset_stages(asset_id, stage, version, done_at) "
+            "VALUES (?, ?, ?, ?)",
+            [(asset_id, s, versions[s], now) for s in done_now],
+        )
+        current = {
+            r[0]: r[1] for r in conn.execute(
+                "SELECT stage, version FROM asset_stages WHERE asset_id=?", (asset_id,)
+            )
+        }
+        complete = all(current.get(s) == versions[s] for s in STAGES)
+        conn.execute(
+            "UPDATE assets SET status=?, error=NULL, error_count=0, "
+            "indexed_at=CASE WHEN ? THEN ? ELSE indexed_at END WHERE id=?",
+            ("active" if complete else "pending", complete, now, asset_id),
+        )
+    return None if target is None else asset_id
+
+
+# --------------------------------------------------------------------------- prune
+
+
+def prune(cfg: Config, dry_run: bool = True) -> list[str]:
+    check_data_dir(cfg)
+    lock = None if dry_run else _acquire_lock(cfg)
+    try:
+        conn = db.open_catalog(cfg)
+        try:
+            return _prune(cfg, conn, dry_run)
+        finally:
+            conn.close()
+    finally:
+        if lock is not None:
+            _release_lock(cfg, lock)
+
+
+_PRUNE_SQL = """
+    SELECT a.id, a.rel_path FROM assets a
+    WHERE a.status = 'missing' AND a.missing_since IS NOT NULL AND a.missing_since < ?
+      AND (a.content_hash IS NULL OR (
+            NOT EXISTS (SELECT 1 FROM ledger.decisions d WHERE d.content_hash = a.content_hash)
+        AND NOT EXISTS (SELECT 1 FROM ledger.usages u WHERE u.content_hash = a.content_hash)
+        AND NOT EXISTS (SELECT 1 FROM ledger.dedupe_actions x
+                        WHERE x.content_hash = a.content_hash)))
+    ORDER BY a.rel_path
+"""
+
+
+def _prune(cfg: Config, conn, dry_run: bool) -> list[str]:
+    cutoff = (datetime.now(UTC) - timedelta(days=cfg.prune_missing_days)).isoformat(
+        timespec="seconds"
+    )
+    rows = conn.execute(_PRUNE_SQL, (cutoff,)).fetchall()
+    if dry_run or not rows:
+        return [r["rel_path"] for r in rows]
+    data_dir = cfg.data_dir.resolve()
+    removed: list[str] = []
+    with db.transaction(conn):
+        for r in conn.execute(_PRUNE_SQL, (cutoff,)).fetchall():  # re-check inside the txn
+            for (local,) in conn.execute(
+                "SELECT local_path FROM images WHERE asset_id=?", (r["id"],)
+            ).fetchall():
+                path = (cfg.data_dir / local).resolve()
+                if path.is_relative_to(data_dir):  # only ever delete our own cache files
+                    path.unlink(missing_ok=True)
+            conn.execute("DELETE FROM search_fts WHERE rowid=?", (r["id"],))
+            conn.execute("DELETE FROM assets WHERE id=?", (r["id"],))
+            removed.append(r["rel_path"])
+    return removed

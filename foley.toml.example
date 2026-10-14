@@ -1,0 +1,40 @@
+# Foley configuration. Copy to foley.toml (or to <data_dir>/foley.toml) and edit.
+# Foley looks for its config in this order: --config, $FOLEY_CONFIG, ./foley.toml,
+# <data_dir>/foley.toml.
+
+[library]
+# Root of the audio library. Every path in the catalog is stored relative to it,
+# so a UNC path and a mapped drive letter for the same share both work.
+root = "//nas.example.local/Assets/Audio"
+
+# Folders directly under the root whose children are packs. For a file at
+# packs/<pack>/<a>/<b>/file.wav, pack = "<pack>" and category_path = "<a>/<b>".
+# Outside a pack root, pack is empty and category_path is the whole folder path.
+pack_roots = ["packs"]
+
+# Files modified more recently than this are skipped until a later run
+# (they may still be copying or extracting).
+settle_minutes = 10
+
+[storage]
+# Local folder for catalog.db, ledger.db and the image cache.
+# Default: %LOCALAPPDATA%\Foley on Windows, ~/.local/share/foley elsewhere.
+# data_dir = "C:/Users/me/AppData/Local/Foley"
+
+[prune]
+# `foley prune` removes catalog rows for files missing longer than this
+# that have no ledger entries. It never touches the library.
+missing_days = 30
+
+[dedupe]
+# Where `foley dedupe apply` moves duplicates. Must be on the same share as the
+# library root and outside it. Unset means dedupe apply is disabled.
+# quarantine_root = "//nas.example.local/Assets/Audio-Quarantine"
+retention_days = 30
+# When identical files live in several packs, keep the copy in the first pack
+# listed here (matched as a prefix of the relative path).
+keep_priority = []
+
+[eval]
+# Hand-labeled test set (kept outside the repo). See eval/testset.example.toml.
+# testset = "C:/Users/me/AppData/Local/Foley/testset.toml"

@@ -1,0 +1,28 @@
+# Foley search test set: the format `foley eval` reads.
+#
+# Keep your real test set outside the repo (it names files in your library) and point
+# foley.toml at it:  [eval] testset = "C:/Users/me/AppData/Local/Foley/testset.toml"
+#
+# Write ~25 queries typical of what your game needs. For each, list 1-3 library files
+# (relative paths, forward slashes) you would accept as a good answer. A query passes
+# when any of them appears in the top 10 results.
+
+[[query]]
+text = "short bright UI confirm beep"
+good = [
+    "packs/Oculus Audio Pack 01/05_user_interface/ui_scifi_traditional_confirm.wav",
+]
+# Optional filters, same names as the search_audio tool:
+# filters = { max_duration_s = 1.0 }
+
+[[query]]
+text = "heavy metal impact with a long ringing tail"
+good = [
+    "packs/Sonniss Audio - 2015/RDGSFX008 - The Metal Shelf/Metal Shelf Hit 10.wav",
+]
+
+[[query]]
+text = "wind through trees with birds, loopable"
+good = [
+    "packs/Oculus Audio Pack 01/03_weather_ambience_etc/ambient_wind_through_trees_with_birds_and_flies_01_lp.wav",
+]
