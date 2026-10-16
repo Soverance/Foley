@@ -368,6 +368,12 @@ def test_every_entry_point_leaves_the_library_alone(
 ):
     guard["armed"] = False
     real = _use_real_or_fake(monkeypatch, tmp_path)
+    from _fake_models import FakeFactory
+
+    from foley import models
+
+    fake_models = FakeFactory()
+    models.set_factory(fake_models)  # the model stages read the library too
     if workers > 1 and not real:
         pytest.skip("parallel analysis needs the real pipeline modules (fakes stay in-process)")
     project = tmp_path / "game"
@@ -378,6 +384,8 @@ def test_every_entry_point_leaves_the_library_alone(
 
     summary = sync.run_index(cfg, workers=workers)
     assert summary.analyzed > 0 and not summary.interrupted
+    assert any(c[0] == "tag" for c in fake_models.calls)
+    assert any(c[0] == "embed" for c in fake_models.calls)
     if real:
         assert summary.errors == 0
     sync.run_index(cfg, force=True, workers=workers)  # every stage again

@@ -1,10 +1,14 @@
 """`foley-mcp`: the MCP server Claude Code talks to (stdio transport).
 
-CONTRACT (Phase 1a tools; Phase 1b adds find_similar, Phase 2 the ledger tools):
+CONTRACT (Phase 1 tools; Phase 2 adds the ledger tools):
 
     search_audio(query, category?, pack?, is_music?, min_duration_s?, max_duration_s?,
                  min_lufs?, max_lufs?, min_attack_s?, max_attack_s?, project?, limit=20)
-        -> search.search(...) result
+        -> search.search(...) result: hybrid keyword + CLAP when embeddings exist,
+           with search settings from config (search.SearchSettings.from_config)
+    find_similar(asset_id, category?, pack?, is_music?, min/max_duration_s?,
+                 min/max_lufs?, min/max_attack_s?, project?, limit=20)
+        -> search.find_similar(...) result: nearest neighbours by CLAP embedding
     describe(asset)                      asset id or library-relative path -> search.describe
     render_comparison(asset_ids)         2-6 ids -> {"image": absolute PNG path, "assets": [...]}
                                          (tool description tells Claude to Read the PNG)
@@ -13,7 +17,7 @@ CONTRACT (Phase 1a tools; Phase 1b adds find_similar, Phase 2 the ledger tools):
     catalog_status()                     -> status.catalog_status
     get_shortlist()                      -> {"count": n, "items": [{id, path, note, caption,
                                          duration_s, lufs, content_hash, added_at, status}]}
-                                         the files Scott starred in `foley browse`, newest
+                                         the files the user starred in `foley browse`, newest
                                          first (browse.shortlist_items over shortlist.json);
                                          id is null when no catalog row has that file any more
 
@@ -51,10 +55,14 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp.exceptions import ToolError
 
 INSTRUCTIONS = (
-    "Foley indexes a sound library you cannot hear. Search it by words, look at spectrogram "
-    "images, then import the chosen file into the game project. Typical flow: search_audio, "
-    "render_comparison on the top 4-6 candidates (then view the PNG with your Read tool), "
-    "import_to_project. get_shortlist returns the sounds Scott starred after listening in "
+    "Foley indexes a sound library you cannot hear. Search it with a short description of "
+    "the sound (search_audio blends keyword matching with CLAP audio-text similarity), look "
+    "at spectrogram images, then import the chosen file into the game project. Typical flow: "
+    "search_audio, find_similar on a good candidate to see alternatives that sound alike, "
+    "render_comparison on the top 4-6 candidates (then view the PNG with your Read tool; in "
+    "it near-black navy is silence, cyan to white is loud, the orange line is the RMS "
+    "envelope), "
+    "import_to_project. get_shortlist returns the sounds the user starred after listening in "
     "`foley browse`. Durations are in seconds, loudness in LUFS, peaks in dBTP. "
     "No tool modifies the audio library."
 )
@@ -130,6 +138,12 @@ def _fail(e: Exception) -> ToolError:
 # ----------------------------------------------------------------------------- tools
 
 
+def _settings():
+    from foley import search
+
+    return search.SearchSettings.from_config(get_config())
+
+
 def tool_search_audio(
     query: str,
     category: str | None = None,
@@ -159,8 +173,42 @@ def tool_search_audio(
             max_attack_s=max_attack_s,
         )
         return search.search(
-            get_conn(), query, filters, project=project, limit=max(1, min(int(limit), 100))
+            get_conn(), query, filters, project=project, limit=max(1, min(int(limit), 100)),
+            settings=_settings(),
         )
+    except Exception as e:  # noqa: BLE001
+        raise _fail(e) from e
+
+
+def tool_find_similar(
+    asset_id: int,
+    category: str | None = None,
+    pack: str | None = None,
+    is_music: bool | None = None,
+    min_duration_s: float | None = None,
+    max_duration_s: float | None = None,
+    min_lufs: float | None = None,
+    max_lufs: float | None = None,
+    min_attack_s: float | None = None,
+    max_attack_s: float | None = None,
+    project: str | None = None,
+    limit: int = 20,
+) -> dict:
+    from foley import search
+
+    try:
+        filters = search.SearchFilters(
+            category=category, pack=pack, is_music=is_music,
+            min_duration_s=min_duration_s, max_duration_s=max_duration_s,
+            min_lufs=min_lufs, max_lufs=max_lufs,
+            min_attack_s=min_attack_s, max_attack_s=max_attack_s,
+        )
+        return search.find_similar(
+            get_conn(), int(asset_id), filters, limit=max(1, min(int(limit), 100)),
+            project=project, settings=_settings(),
+        )
+    except LookupError as e:
+        raise ToolError(f"no such asset: {asset_id}") from e
     except Exception as e:  # noqa: BLE001
         raise _fail(e) from e
 
@@ -257,18 +305,33 @@ def tool_get_shortlist() -> dict:
 # ----------------------------------------------------------------------------- server
 
 SEARCH_DESCRIPTION = (
-    "Search the sound library by keywords. Returns ranked candidates, each with id, "
-    "library-relative path, score, a one-line caption, top 3 tags, duration_s (seconds), "
-    "lufs (integrated LUFS; null for clips under 0.4 s), attack_s (seconds), license and "
+    "Search the sound library. Returns ranked candidates, each with id, library-relative "
+    "path, score, similarity, a one-line caption, top 3 tags, duration_s (seconds), lufs "
+    "(integrated LUFS; null for clips under 0.4 s), attack_s (seconds), license and "
     "`duplicates` (number of other exact copies, already collapsed out of the list). "
-    "`note` warns when the catalog is stale. Search is KEYWORD-ONLY for now (file names, "
-    "folders, UCS categories, metadata, tags, captions): use concrete words a file name might "
-    "contain ('nail scratch', 'metal impact', 'ui confirm'), try synonyms, and combine with "
-    "filters. Words are OR-ed, so files matching more of them rank higher. An empty query "
-    "lists files matching the filters ordered by path. Filters: `category` (folder or UCS "
-    "category prefix), `pack`, `is_music`, duration_s / LUFS / attack_s ranges. Pass `project` "
-    "to hide files rejected for that project. Next steps: describe for one file, or "
-    "render_comparison on the top 4-6 and view the image."
+    "When `mode` is 'hybrid', keyword matching over file names, folders, UCS categories, "
+    "metadata, AudioSet tags and captions is blended with CLAP similarity between your text "
+    "and the audio itself, so files are found by how they sound even when their names say "
+    "nothing: describe the sound in a short phrase ('heavy metal impact with a long ringing "
+    "tail', 'short bright UI confirm beep') and include concrete words a file name might "
+    "contain. `score` is the blended 0..1 rank; `similarity` is the CLAP cosine (null for "
+    "files not embedded yet). When `mode` is 'keyword' (`note` says why, e.g. no embeddings "
+    "yet) only words matter: use words a file name might contain and try synonyms. Words "
+    "are OR-ed, so files matching more of them rank higher. `note` also warns when the "
+    "catalog is stale. An empty query lists files matching the filters ordered by path. "
+    "Filters: `category` (folder or UCS category prefix), `pack`, `is_music`, duration_s / "
+    "LUFS / attack_s ranges. Pass `project` to hide files rejected for that project. Next "
+    "steps: find_similar on a promising hit, describe for one file, or render_comparison on "
+    "the top 4-6 and view the image."
+)
+SIMILAR_DESCRIPTION = (
+    "Sounds that sound like a given file: nearest neighbours of `asset_id` by CLAP audio "
+    "embedding, best first. Same result shape as search_audio plus `source`; `similarity` "
+    "(= score) is the cosine: higher is closer, near 1 for variations of the same take. "
+    "The file itself and its exact copies are left out and duplicates collapse. Takes the "
+    "same filters as search_audio (e.g. max_duration_s, is_music=false) and `project`. Use "
+    "it to find variations of a sound the user liked or alternatives to a near miss. `note` "
+    "explains an empty result (file not embedded yet, no CLAP models)."
 )
 DESCRIBE_DESCRIPTION = (
     "Full record for one file: metadata, measured features (duration_s, LUFS, true peak in "
@@ -282,7 +345,11 @@ COMPARISON_DESCRIPTION = (
     "below, identical scales and a shared time axis so lengths and spectra compare "
     "visually). Returns {image: absolute PNG path, assets: [...]}. You cannot hear audio: "
     "view the image with your Read tool on the returned `image` path, then choose by "
-    "duration, attack shape, brightness and noisiness. May take a few seconds the first "
+    "duration, attack shape, brightness and noisiness. Reading it: the waveform is cyan on "
+    "a fixed -1..1 scale (dashed lines at -6 and -20 dBFS) and the orange line is its RMS "
+    "envelope; the spectrogram runs 20 Hz to 24 kHz on a mel axis at a fixed -80..0 dBFS, "
+    "near-black navy = silence, through blue to cyan, white = loud; a hatched area after "
+    "an 'end' line is past the end of a shorter clip. May take a few seconds the first "
     "time while images render."
 )
 IMPORT_DESCRIPTION = (
@@ -301,12 +368,12 @@ STATUS_DESCRIPTION = (
     "versions and files that failed analysis. Call it when search results look stale or empty."
 )
 SHORTLIST_DESCRIPTION = (
-    "The sounds Scott starred while auditioning in `foley browse` (the local web UI where "
+    "The sounds the user starred while auditioning in `foley browse` (the local web UI where "
     "he can actually listen), newest first. Each item: id (asset id for describe / "
     "render_comparison / import_to_project; null if the file is no longer in the catalog), "
     "library-relative path, his note (often the intended use, e.g. 'for boss hit?'), "
     "caption, duration_s (seconds), lufs (integrated LUFS; null under 0.4 s), content_hash, "
-    "added_at and status. Call it when Scott says he picked or starred sounds, before "
+    "added_at and status. Call it when the user says they picked or starred sounds, before "
     "searching for something he may already have chosen."
 )
 
@@ -342,6 +409,26 @@ def build_server():
             max_attack_s,
             project,
             limit,
+        )
+
+    @server.tool(name="find_similar", description=SIMILAR_DESCRIPTION)
+    async def find_similar(
+        asset_id: int,
+        category: str | None = None,
+        pack: str | None = None,
+        is_music: bool | None = None,
+        min_duration_s: float | None = None,
+        max_duration_s: float | None = None,
+        min_lufs: float | None = None,
+        max_lufs: float | None = None,
+        min_attack_s: float | None = None,
+        max_attack_s: float | None = None,
+        project: str | None = None,
+        limit: int = 20,
+    ) -> dict:
+        return tool_find_similar(
+            asset_id, category, pack, is_music, min_duration_s, max_duration_s, min_lufs,
+            max_lufs, min_attack_s, max_attack_s, project, limit,
         )
 
     @server.tool(name="describe", description=DESCRIBE_DESCRIPTION)

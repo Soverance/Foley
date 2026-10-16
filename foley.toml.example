@@ -37,7 +37,30 @@ keep_priority = []
 
 [eval]
 # Hand-labeled test set (kept outside the repo). See eval/testset.example.toml.
+# `foley eval` scores search against it, and `foley browse` shows a Test set panel
+# for marking answers while you listen (it rewrites this file, keeping its header).
 # testset = "C:/Users/me/AppData/Local/Foley/testset.toml"
+
+[search]
+# Hybrid search blends keyword matching with CLAP audio-text similarity. Leave both
+# unset to use what `foley eval --adopt` recorded in the catalog (the tuned values),
+# else the first checkpoint in [models] clap and a blend weight of 0.5.
+# clap_model = "htsat-unfused"   # a CLAP checkpoint name that has embeddings
+# blend_weight = 0.5             # 0 = keyword only ... 1 = CLAP similarity only
+
+[models]
+# AudioSet tags (PANNs CNN14) and CLAP embeddings, computed by `foley index` after the
+# other stages; files are searchable before they are done. Weights download on first
+# use: PANNs (~330 MB) into <data_dir>/models, CLAP (0.6-0.8 GB each) into the Hugging
+# Face cache (HF_HOME). With enabled = false a plain `foley index` skips them;
+# `foley index --stage tags --stage embeddings` still runs them.
+enabled = true
+# Where inference runs: "auto" (CUDA GPU when torch sees one, else CPU), "cuda" or "cpu".
+device = "auto"
+# CLAP checkpoints to compute (several can coexist, so `foley eval` can compare them).
+# Empty or unset = all of: "larger-general", "htsat-unfused", "htsat-fused".
+# Removing one later re-runs nothing; adding one computes only that one.
+# clap = ["larger-general"]
 
 [browse]
 # `foley browse` (local web UI) plays every clip matched to this integrated loudness
@@ -58,6 +81,12 @@ allowed_hosts = []
 # host = "0.0.0.0"
 # port = 80
 # allowed_hosts = ["foley.example.lan"]
+
+# Optional branding for the browser's top bar, kept outside the repo: a folder that may
+# hold `logo.png` (the round mark next to the product name, shown 30 px wide, so about
+# 128 px square is plenty) and `wordmark.png` (a light-on-dark line under the name, shown
+# 7 px tall). Either may be missing. Without brand_dir the UI shows a neutral mark.
+# brand_dir = "C:/Users/you/AppData/Local/Foley/brand"
 
 [schedule]
 # Daily library scan run by `foley browse` while it is running (an incremental

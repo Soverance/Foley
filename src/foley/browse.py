@@ -31,7 +31,7 @@ CONTRACT:
     wav_bytes(samples, sample_rate) -> bytes        16-bit PCM WAV, >2 channels -> mono
     parse_range(header, size) -> (start, end) | None   raises _Unsatisfiable (-> 416)
 
-    Shortlist (Scott's stars; also read by the MCP tool `get_shortlist`):
+    Shortlist (the user's stars; also read by the MCP tool `get_shortlist`):
     SHORTLIST_FILE = "shortlist.json", stored in cfg.data_dir as
         {content_hash: {"rel_path", "note", "added_at"}}. Keyed by content_hash like the
         ledger, so a star survives moves and renames. Not in ledger.db (no schema change).
@@ -45,17 +45,36 @@ CONTRACT:
 
     HTTP API (JSON unless noted; errors are {"error": "..."} with a 4xx/5xx status):
         GET  /                    index.html from browse_ui/ (placeholder page if missing)
-        GET  /static/<name>       whitelisted files of browse_ui/ (index.html, app.js, app.css)
+        GET  /static/<name>       whitelisted files of browse_ui/ (STATIC_FILES: index.html,
+                                  app.js, app.css and the OFL web fonts under fonts/); any
+                                  other name, case or path is 404
+        GET  /brand/<name>        logo.png or wordmark.png from [browse] brand_dir when that
+                                  file exists (BRAND_FILES; nothing else is served from the
+                                  folder), else 404. Optional studio branding kept out of
+                                  the repo; the UI falls back to a neutral built-in mark.
         GET  /api/status          {library_root, assets: {active, missing, error, pending},
                                    note, has_tags, has_embeddings, shortlist_count,
                                    loudness_target_lufs, scan: ScanScheduler.status:
                                    {running, enabled, next_run_at, last_completed_at,
-                                   trigger, started_at, progress (latest log line)}}
+                                   trigger, started_at, progress (latest log line)},
+                                   semantic: {available, model, weight, embeddings,
+                                   encoder (unloaded|loading|ready|failed), error},
+                                   has_testset, testset_path,
+                                   brand: {logo: bool, wordmark: bool} (which /brand/
+                                   files exist)}
         GET  /api/tree?path=      {path, files, folders: [{name, path, count}]}: immediate
                                   children of a folder ("" = root); counts are active assets,
                                   recursive; `files` = active assets directly in the folder;
                                   folders sorted case-insensitively. 404 for an unknown folder.
-        GET  /api/list            {total, offset, limit, note, results: [row]}; see LISTING
+        GET  /api/list            {total, offset, limit, note, mode, model, results: [row]};
+                                  see LISTING
+        GET  /api/similar/<id>    the same payload (plus source: {id, path, name}) for the
+                                  sounds most like asset <id> by CLAP embedding
+                                  (search.similar_ranking, at most SIMILAR_CANDIDATES,
+                                  duplicates collapsed, the asset's own copies left out),
+                                  with the LISTING filter, sort and paging params (q is
+                                  ignored; relevance = similarity, the default). mode
+                                  "similar"; 404 for an unknown id.
         GET  /api/asset/<id>      search.describe(conn, id) plus {starred, star_note,
                                   audio_url, image_url, peaks_url, image_plot_x}
         GET  /api/audio/<id>      the file's bytes (read-only), Accept-Ranges/Range -> 206,
@@ -76,6 +95,25 @@ CONTRACT:
         POST /api/shortlist       body {"id", "starred", "note"?} -> {"starred", "note"};
                                   unstar removes the entry; starring again with a note
                                   updates the note, without "note" keeps the old one.
+
+    Test set (eval/testset.example.toml format, file at [eval] testset; foley.testset
+    reads and writes it atomically, keeping its header comment block; every write re-reads
+    the file first, so hand edits between requests survive):
+        GET  /api/testset         {path, exists, max_answers, queries: [{index, text, cue,
+                                   filters, answers, good: [{path, id, status, ids}]}]}
+                                  (id/status null for a path not in the catalog; ids =
+                                  every active asset with that file's content, so copies
+                                  count). 404 when [eval] testset is unset, 422 when the
+                                  file cannot be parsed.
+        POST /api/testset/mark    body {query_index, id, good: bool, text?} -> {query,
+                                  changed, warning}: adds the asset's rel_path to `good`
+                                  (no-op if it or an exact copy is there) or removes it and
+                                  any exact copy. `text`, when given, must equal the
+                                  query's text (409 otherwise: the file changed). warning
+                                  when a query has more than testset.MAX_ANSWERS answers.
+        POST /api/testset/query   body {text, cue?, filters?} -> {index, query}; appends a
+                                  query (filters as in the file; bad names/values -> 400)
+        DELETE /api/testset/query/<index>?text=  -> {deleted, count}; 409 if text differs
 
     Scans (see foley.scans; times are ISO 8601 with the server's UTC offset, slots are
     the server machine's local wall-clock time):
@@ -107,12 +145,17 @@ CONTRACT:
         relevance with q else name), offset (>= 0), limit (1..1000, default 200).
         Bad values -> 400. Row: {id, path, name, folder, ext, caption, duration_s, lufs,
         true_peak_db, attack_s, sample_rate, channels, tags (top 3 labels), duplicates
-        (other active copies), starred, score (None without q)}. Sorting puts unknown
-        values last. Without q every file is listed (duplicates not collapsed). With q,
-        candidates come from search.rank (the search.search ranking) restricted to the
-        folder via SearchFilters.folder, at most SEARCH_CANDIDATES of them (the note says
-        so when the cap is hit), then filtered, and exact duplicates collapse to the
-        best-ranked copy.
+        (other active copies), starred, score (None without q), similarity (CLAP cosine
+        or None)}. Sorting puts unknown values last. Without q every file is listed
+        (duplicates not collapsed; mode null). With q, candidates come from
+        search.ranking (the search.search ranking, hybrid keyword + CLAP when embeddings
+        exist, with SearchSettings.from_config) restricted to the folder via
+        SearchFilters.folder and to the filters, at most SEARCH_CANDIDATES of them (the
+        note says so when the keyword cap is hit), and exact duplicates collapse to the
+        best-ranked copy. mode is "hybrid" or "keyword" (the note says why) and model the
+        CLAP checkpoint in hybrid mode. In hybrid mode score is the blended 0..1 match.
+        The first hybrid query after start loads the CLAP text encoder on the CPU, which
+        can take seconds; the request just waits (the UI says so).
 
     Security: a request's Host header (case-insensitive, port ignored) must name
     localhost / a loopback IP, the explicitly bound address, or an entry of [browse]
@@ -123,7 +166,8 @@ CONTRACT:
     name, and `folder` is only compared as a path prefix (in memory, or as an escaped
     SQL LIKE prefix through SearchFilters.folder). Nothing here writes to the library;
     writes go to cfg.data_dir only (image cache + `images` rows via images.render_overview,
-    peaks cache, shortlist.json, schedule.json, logs/). Scans run `foley index` in a
+    peaks cache, shortlist.json, schedule.json, logs/) and to the [eval] testset file.
+    Scans run `foley index` in a
     subprocess, which is read-only on the library like every `foley index`.
 
 DESIGN NOTES:
@@ -134,7 +178,8 @@ DESIGN NOTES:
     sortable features), rebuilt when a cheap catalog fingerprint changes (row counts,
     latest index run, catalog file identity; checked at most every CHECK_INTERVAL_S).
     Per-sort orders, the folder tree, ranked search candidates and filtered results are
-    cached per snapshot, so paging is a slice. Captions and tags are fetched per page.
+    cached per snapshot (and per search settings), so paging is a slice. Captions and
+    tags are fetched per page.
     Decodes (peaks, transcode) are limited to DECODE_SLOTS at a time; transcoded WAVs
     are kept in a small in-memory LRU so Range requests do not decode again. Peaks
     stream the file in blocks, so a 30-minute 96 kHz recording costs I/O, not a
@@ -175,7 +220,16 @@ STATIC_FILES = {
     "index.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
     "app.css": "text/css; charset=utf-8",
+    # Latin subsets of OFL fonts (licences in fonts/*-OFL.txt), so the UI works offline.
+    "fonts/Michroma-400.woff2": "font/woff2",
+    "fonts/Barlow-400.woff2": "font/woff2",
+    "fonts/Barlow-500.woff2": "font/woff2",
+    "fonts/Barlow-600.woff2": "font/woff2",
+    "fonts/JetBrainsMono.woff2": "font/woff2",  # variable (wght axis): 400 and 500
 }
+# Optional branding from [browse] brand_dir; only these names, only regular files.
+BRAND_FILES = {"logo.png": "image/png", "wordmark.png": "image/png"}
+_MAX_BRAND_BYTES = 4 * 1024 * 1024
 AUDIO_TYPES = {
     ".wav": "audio/wav",
     ".mp3": "audio/mpeg",
@@ -188,6 +242,7 @@ PEAKS_VERSION = "1"
 PEAKS_DEFAULT_N = 1600
 PEAKS_MIN_N, PEAKS_MAX_N = 16, 8000
 SEARCH_CANDIDATES = 2000
+SIMILAR_CANDIDATES = 500
 LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT = 200, 1000
 CHECK_INTERVAL_S = 1.0
 DECODE_SLOTS = 2
@@ -507,6 +562,7 @@ def _fingerprint(conn: sqlite3.Connection, catalog_path: Path) -> tuple:
         "SELECT (SELECT count(*) FROM assets), (SELECT coalesce(max(id), 0) FROM assets), "
         "(SELECT count(*) FROM assets WHERE status = 'active'), "
         "(SELECT count(*) FROM captions), (SELECT count(*) FROM tags), "
+        "(SELECT count(*) FROM embeddings), "
         "(SELECT id || ':' || status || ':' || coalesce(finished_at, '') FROM index_runs "
         " ORDER BY id DESC LIMIT 1)"
     ).fetchone()
@@ -758,9 +814,9 @@ class BrowseApp:
         self.peaks_dir = cfg.data_dir / "peaks"
         self.check_interval_s = CHECK_INTERVAL_S
         self.render_lock = threading.Lock()
+        self.testset_lock = threading.Lock()
         self.decode_slots = threading.BoundedSemaphore(DECODE_SLOTS)
         self.transcodes = _LRU(max_items=16, max_bytes=TRANSCODE_CACHE_BYTES)
-        self._ranked = _LRU(max_items=32)
         self._filtered = _LRU(max_items=32)
         self._snap: _Snapshot | None = None
         self._snap_print = None
@@ -778,7 +834,6 @@ class BrowseApp:
         with self._snap_lock:
             self._snap = None
             self._snap_print = None
-        self._ranked.clear()
         self._filtered.clear()
 
     def snapshot(self, conn: sqlite3.Connection) -> _Snapshot:
@@ -792,7 +847,6 @@ class BrowseApp:
                 self._snap_version += 1
                 self._snap = _Snapshot(conn, self._snap_version)
                 self._snap_print = fp
-                self._ranked.clear()
                 self._filtered.clear()
             return self._snap
 
@@ -815,7 +869,52 @@ class BrowseApp:
             "shortlist_count": len(self.shortlist.current()[1]),
             "loudness_target_lufs": float(self.cfg.browse_loudness_target_lufs),
             "scan": self.scans.status(conn),
+            "semantic": self.semantic_status(conn),
+            "has_testset": self.cfg.testset is not None,
+            "testset_path": str(self.cfg.testset) if self.cfg.testset else None,
+            "brand": {name.split(".")[0]: self.brand_file(name) is not None
+                      for name in BRAND_FILES},
         }
+
+    def brand_file(self, name: str) -> Path | None:
+        """The [browse] brand_dir file `name` (a BRAND_FILES key) if it exists, else None."""
+        folder = self.cfg.browse_brand_dir
+        if name not in BRAND_FILES or folder is None:
+            return None
+        path = Path(folder) / name
+        try:
+            return path if path.is_file() else None
+        except OSError:
+            return None
+
+    def search_settings(self):
+        from foley import search
+
+        return search.SearchSettings.from_config(self.cfg)
+
+    def _settings_key(self, conn: sqlite3.Connection) -> tuple:
+        """What the search ranking depends on besides the catalog (config + meta)."""
+        st = self.search_settings()
+        return (st.clap_model, st.blend_weight, st.models_clap,
+                db.get_meta(conn, "search_clap_model"), db.get_meta(conn, "search_blend_weight"))
+
+    def semantic_status(self, conn: sqlite3.Connection) -> dict:
+        from foley import search, vectors
+
+        settings = self.search_settings()
+        weight, _ = search.resolve_weight(conn, settings)
+        out = {"available": False, "model": None, "weight": weight, "embeddings": 0,
+               "encoder": "unloaded", "error": None}
+        models = vectors.embedding_models(conn)
+        if not models:  # nothing to search with: do not import the models package
+            return out
+        r = search.resolve(conn, settings)
+        count = models.get(r.model_key, 0) if r.model_key else 0
+        out.update(model=r.clap_model, embeddings=count, available=bool(count and weight > 0))
+        if r.clap_model:
+            out["encoder"] = vectors.encoder_state(r.clap_model)
+            out["error"] = vectors.encoder_error(r.clap_model)
+        return out
 
     # ----------------------------------------------------------------- scans
 
@@ -856,27 +955,36 @@ class BrowseApp:
         snap = self.snapshot(conn)
         star_version, starred = self.shortlist.current()
         terms = tuple(search.query_terms(p.q)) if p.q else ()
+        text = " ".join(p.q.split()) if terms else ""
         sort = p.sort or ("relevance" if terms else "name")
         if sort == "relevance" and not terms:
             sort = "name"
-        key = (snap.version, star_version if p.starred else None, terms, sort, *p.filter_key())
+        skey = self._settings_key(conn) if terms else None
+        key = (snap.version, star_version if p.starred else None, text, skey, sort,
+               *p.filter_key())
         cached = self._filtered.get(key)
         if cached is None:
             pred = p.predicate(starred)
             if terms:
-                cached = self._search_matches(conn, snap, terms, p.folder, pred, sort)
+                cached = self._search_matches(conn, snap, text, p, pred, sort)
             else:
-                cached = ([(e, None) for e in snap.order(sort) if pred(e)], False)
+                cached = ([(e, None, None) for e in snap.order(sort) if pred(e)], False,
+                          None, None, [])
             self._filtered.put(key, cached)
-        rows, capped = cached
-        notes = [n for n in (_staleness_note(conn),) if n]
+        rows, capped, mode, model, search_notes = cached
+        notes = [n for n in (_staleness_note(conn),) if n] + list(search_notes)
         if capped:
             notes.append(
                 f"showing the best {SEARCH_CANDIDATES} keyword matches; add words or "
                 "pick a folder to narrow the search"
             )
+        return {**self._page(conn, snap, rows, p, starred, notes), "mode": mode,
+                "model": model}
+
+    def _page(self, conn, snap: _Snapshot, rows: list, p: _ListParams, starred: frozenset,
+              notes: list[str]) -> dict:
         page = rows[p.offset : p.offset + p.limit]
-        ids = [e.id for e, _ in page]
+        ids = [e.id for e, _, _ in page]
         caps = _captions(conn, ids)
         tags = _tags(conn, ids)
         results = [
@@ -897,8 +1005,9 @@ class BrowseApp:
                 "duplicates": snap.duplicates(e),
                 "starred": bool(e.content_hash and e.content_hash in starred),
                 "score": score,
+                "similarity": None if sim is None else round(sim, 4),
             }
-            for e, score in page
+            for e, score, sim in page
         ]
         return {
             "total": len(rows),
@@ -908,24 +1017,25 @@ class BrowseApp:
             "results": results,
         }
 
-    def _search_matches(self, conn, snap: _Snapshot, terms: tuple, folder: str, pred,
-                        sort: str) -> tuple[list, bool]:
-        """Ranked candidates in the folder that pass the filters, duplicates collapsed."""
+    def _search_matches(self, conn, snap: _Snapshot, text: str, p: _ListParams, pred,
+                        sort: str) -> tuple:
+        """(rows, capped, mode, model, notes): ranked candidates in the folder that pass
+        the filters, duplicates collapsed. Rows are (entry, score, similarity)."""
         from foley import search
 
-        key = (snap.version, terms, folder)
-        got = self._ranked.get(key)
-        if got is None:
-            ranked = search.rank(
-                conn, " ".join(terms), search.SearchFilters(folder=folder or None),
-                limit=SEARCH_CANDIDATES,
-            )
-            got = (ranked, len(ranked) >= SEARCH_CANDIDATES)
-            self._ranked.put(key, got)
-        ranked, capped = got
+        restrict = [e.id for e in snap.entries if pred(e)] if p.has_filters() else None
+        r = search.ranking(conn, text, search.SearchFilters(folder=p.folder or None),
+                           limit=SEARCH_CANDIDATES, settings=self.search_settings(),
+                           restrict=restrict)
+        matches = self._collapse(snap, ((h.id, round(h.score, 3), h.similarity) for h in r.hits),
+                                 pred, sort)
+        return matches, len(r.hits) >= SEARCH_CANDIDATES, r.mode, r.model, r.notes
+
+    @staticmethod
+    def _collapse(snap: _Snapshot, ranked, pred, sort: str) -> list:
         seen: set[str] = set()
         matches = []
-        for aid, score in ranked:
+        for aid, score, sim in ranked:
             e = snap.by_id.get(aid)
             if e is None or not pred(e):
                 continue
@@ -933,11 +1043,178 @@ class BrowseApp:
                 if e.content_hash in seen:
                     continue
                 seen.add(e.content_hash)
-            matches.append((e, score))
+            matches.append((e, score, sim))
         if sort != "relevance":
             keyfn = _SORT_KEYS["name" if sort == "-name" else sort]
             matches.sort(key=lambda es: keyfn(es[0]), reverse=sort == "-name")
-        return matches, capped
+        return matches
+
+    def similar(self, conn: sqlite3.Connection, aid: int, qs: dict) -> dict:
+        from foley import search
+
+        p = _ListParams(qs)
+        snap = self.snapshot(conn)
+        star_version, starred = self.shortlist.current()
+        sort = p.sort or "relevance"
+        key = ("similar", aid, snap.version, star_version if p.starred else None,
+               self._settings_key(conn), sort, *p.filter_key())
+        cached = self._filtered.get(key)
+        if cached is None:
+            pred = p.predicate(starred)
+            restrict = [e.id for e in snap.entries if pred(e)] if p.has_filters() else None
+            try:
+                sim = search.similar_ranking(
+                    conn, aid, search.SearchFilters(folder=p.folder or None),
+                    limit=SIMILAR_CANDIDATES, settings=self.search_settings(),
+                    restrict=restrict)
+            except LookupError as e:
+                raise _HTTPError(404, f"no such asset: {aid}") from e
+            rows = self._collapse(snap, ((a, round(c, 4), c) for a, c in sim.hits), pred, sort)
+            name = sim.source["rel_path"].rpartition("/")[2]
+            source = {"id": sim.source["id"], "path": sim.source["rel_path"], "name": name}
+            cached = (rows, sim.model, sim.notes, source)
+            self._filtered.put(key, cached)
+        rows, model, sim_notes, source = cached
+        notes = [n for n in (_staleness_note(conn),) if n] + list(sim_notes)
+        return {**self._page(conn, snap, rows, p, starred, notes), "mode": "similar",
+                "model": model, "source": source}
+
+    # ----------------------------------------------------------------- test set
+
+    def _testset_file(self) -> Path:
+        if self.cfg.testset is None:
+            raise _HTTPError(404, "no test set: set [eval] testset in foley.toml")
+        return Path(self.cfg.testset)
+
+    def _load_testset(self):
+        from foley import testset
+
+        try:
+            return testset.load(self._testset_file())
+        except testset.TestsetError as e:
+            raise _HTTPError(422, f"cannot read the test set: {e}") from e
+        except OSError as e:
+            raise _HTTPError(422, f"cannot read the test set: {e}") from e
+
+    def _save_testset(self, ts) -> None:
+        from foley import testset
+
+        try:
+            testset.save(ts, self._testset_file())
+        except (testset.TestsetError, OSError) as e:
+            raise _HTTPError(422, f"cannot write the test set: {e}") from e
+
+    def _query_view(self, conn: sqlite3.Connection, index: int, q) -> dict:
+        good = []
+        for rel in q.good:
+            row = conn.execute(
+                "SELECT id, status, content_hash FROM assets WHERE rel_path = ?", (rel,)
+            ).fetchone()
+            ids = []
+            if row is not None and row["content_hash"]:
+                ids = [r[0] for r in conn.execute(
+                    "SELECT id FROM assets WHERE content_hash = ? AND +status = 'active' "
+                    "ORDER BY id", (row["content_hash"],))]
+            elif row is not None and row["status"] == "active":
+                ids = [row["id"]]
+            good.append({"path": rel, "id": row["id"] if row else None,
+                         "status": row["status"] if row else None, "ids": ids})
+        return {"index": index, "text": q.text, "cue": q.cue, "filters": dict(q.filters),
+                "answers": len(q.good), "good": good}
+
+    def testset_view(self, conn: sqlite3.Connection) -> dict:
+        from foley import testset
+
+        with self.testset_lock:
+            path = self._testset_file()
+            ts = self._load_testset()
+        return {"path": str(path), "exists": path.is_file(), "max_answers": testset.MAX_ANSWERS,
+                "queries": [self._query_view(conn, i, q) for i, q in enumerate(ts.queries)]}
+
+    @staticmethod
+    def _pick_query(ts, index, text):
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise _HTTPError(400, "body needs a numeric `query_index`")
+        if not 0 <= index < len(ts.queries):
+            raise _HTTPError(404, f"no test query #{index}")
+        q = ts.queries[index]
+        if text is not None and text != q.text:
+            raise _HTTPError(409, "the test set changed on disk (query text differs); reload it")
+        return q
+
+    def testset_mark(self, conn: sqlite3.Connection, body: dict) -> dict:
+        from foley import testset
+
+        good = body.get("good")
+        if not isinstance(good, bool):
+            raise _HTTPError(400, "body needs `good`: true or false")
+        try:
+            aid = int(body.get("id"))
+        except (TypeError, ValueError) as e:
+            raise _HTTPError(400, "body needs a numeric `id`") from e
+        text = body.get("text")
+        if text is not None and not isinstance(text, str):
+            raise _HTTPError(400, "`text` must be a string")
+        row = self.asset_row(conn, aid)
+        with self.testset_lock:
+            ts = self._load_testset()
+            index = body.get("query_index")
+            q = self._pick_query(ts, index, text)
+            same = set()
+            for rel in q.good:
+                r = conn.execute("SELECT content_hash FROM assets WHERE rel_path = ?",
+                                 (rel,)).fetchone()
+                if rel == row["rel_path"] or (r and row["content_hash"]
+                                              and r[0] == row["content_hash"]):
+                    same.add(rel)
+            changed = False
+            if good and not same:
+                q.good.append(row["rel_path"])
+                changed = True
+            elif not good and same:
+                q.good = [g for g in q.good if g not in same]
+                changed = True
+            if changed:
+                self._save_testset(ts)
+        warning = None
+        if len(q.good) > testset.MAX_ANSWERS:
+            warning = (f"this query has {len(q.good)} answers; 1-{testset.MAX_ANSWERS} of the "
+                       "best ones keep the test set sharp")
+        return {"query": self._query_view(conn, index, q), "changed": changed,
+                "warning": warning}
+
+    def testset_add_query(self, conn: sqlite3.Connection, body: dict) -> dict:
+        from foley import testset
+
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise _HTTPError(400, "body needs a non-empty `text`")
+        cue = body.get("cue")
+        if cue is not None and not isinstance(cue, str):
+            raise _HTTPError(400, "`cue` must be a string")
+        try:
+            filters = testset.check_filters(body.get("filters") or {})
+        except testset.TestsetError as e:
+            raise _HTTPError(400, str(e)) from e
+        q = testset.Query(" ".join(text.split()), [], cue.strip() if cue and cue.strip()
+                          else None, filters)
+        with self.testset_lock:
+            ts = self._load_testset()
+            ts.queries.append(q)
+            self._save_testset(ts)
+            index = len(ts.queries) - 1
+        return {"index": index, "query": self._query_view(conn, index, q)}
+
+    def testset_delete_query(self, index_text: str, qs: dict) -> dict:
+        if not index_text.isdigit():
+            raise _HTTPError(404, f"no test query #{index_text}")
+        text = (qs.get("text") or [None])[-1]
+        with self.testset_lock:
+            ts = self._load_testset()
+            self._pick_query(ts, int(index_text), text)
+            del ts.queries[int(index_text)]
+            self._save_testset(ts)
+            return {"deleted": int(index_text), "count": len(ts.queries)}
 
     # ----------------------------------------------------------------- asset
 
@@ -1162,6 +1439,10 @@ class _ListParams:
     def filter_key(self) -> tuple:
         return (self.folder, tuple(self.bounds), self.is_music, self.exts, self.starred)
 
+    def has_filters(self) -> bool:
+        """Any filter besides the folder (which SearchFilters.folder applies in SQL)."""
+        return bool(self.bounds or self.is_music is not None or self.exts or self.starred)
+
     def predicate(self, starred: frozenset):
         checks = []
         if self.folder:
@@ -1288,6 +1569,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         self._dispatch("POST")
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._dispatch("DELETE")
+
     def _dispatch(self, method: str) -> None:
         try:
             if not self._host_ok():
@@ -1298,12 +1582,15 @@ class _Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = unquote(parts.path)
             qs = parse_qs(parts.query, keep_blank_values=True)
-            if method == "POST":
+            if method in ("POST", "DELETE"):
                 self.close_connection = True  # never reuse a connection after a body
                 if not self._origin_ok():
                     self._error(403, "cross-origin request refused")
                     return
-                self._route_post(path)
+                if method == "DELETE":
+                    self._route_delete(path, qs)
+                else:
+                    self._route_post(path)
             else:
                 self._route_get(path, qs)
         except _HTTPError as e:
@@ -1332,6 +1619,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if path.startswith("/static/"):
             return self._static(path[len("/static/") :])
+        if path.startswith("/brand/"):
+            return self._brand(path[len("/brand/") :])
         if path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
         if path == "/api/status":
@@ -1344,6 +1633,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(app.shortlist_items(self.conn))
         if path == "/api/scans":
             return self._json(app.scans.snapshot(self.conn))
+        if path == "/api/testset":
+            return self._json(app.testset_view(self.conn))
         if path.startswith("/api/scans/log/"):
             return self._scan_log(path[len("/api/scans/log/") :])
         head, _, rest = path.strip("/").partition("/")
@@ -1351,6 +1642,8 @@ class _Handler(BaseHTTPRequestHandler):
         if head == "api" and ident and "/" not in ident:
             if kind == "asset":
                 return self._json(app.asset(self.conn, self._id(ident)))
+            if kind == "similar":
+                return self._json(app.similar(self.conn, self._id(ident), qs))
             if kind == "audio":
                 flag = (qs.get("transcode") or ["0"])[-1].lower()
                 return self._audio(self._id(ident), flag in ("1", "true", "yes"))
@@ -1364,7 +1657,17 @@ class _Handler(BaseHTTPRequestHandler):
     _SCAN_ACTIONS = {"/api/scans/schedule": "schedule", "/api/scans/run": "run",
                      "/api/scans/stop": "stop"}
 
+    def _route_delete(self, path: str, qs: dict) -> None:
+        prefix = "/api/testset/query/"
+        if not path.startswith(prefix):
+            raise _HTTPError(404, f"not found: {path}")
+        self._json(self.app.testset_delete_query(path[len(prefix):], qs))
+
     def _route_post(self, path: str) -> None:
+        if path == "/api/testset/mark":
+            return self._json(self.app.testset_mark(self.conn, self._body()))
+        if path == "/api/testset/query":
+            return self._json(self.app.testset_add_query(self.conn, self._body()))
         if path != "/api/shortlist" and path not in self._SCAN_ACTIONS:
             raise _HTTPError(404, f"not found: {path}")
         action = self._SCAN_ACTIONS.get(path)
@@ -1402,7 +1705,22 @@ class _Handler(BaseHTTPRequestHandler):
             if name != "index.html":
                 raise _HTTPError(404, f"not found: /static/{name}") from None
             body = _PLACEHOLDER
-        self._send(200, body, STATIC_FILES[name], {"Cache-Control": "no-cache"})
+        # Fonts never change under a name; the app files revalidate on every load.
+        cache = "max-age=604800" if name.startswith("fonts/") else "no-cache"
+        self._send(200, body, STATIC_FILES[name], {"Cache-Control": cache})
+
+    def _brand(self, name: str) -> None:
+        path = self.app.brand_file(name)
+        if path is None:
+            raise _HTTPError(404, f"not found: /brand/{name}")
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read(_MAX_BRAND_BYTES + 1)
+        except OSError:
+            raise _HTTPError(404, f"not found: /brand/{name}") from None
+        if len(body) > _MAX_BRAND_BYTES:
+            raise _HTTPError(404, f"/brand/{name} is larger than 4 MB")
+        self._send(200, body, BRAND_FILES[name], {"Cache-Control": "no-cache"})
 
     def _scan_log(self, name: str) -> None:
         path = scans_mod.log_path(self.app.cfg, name)

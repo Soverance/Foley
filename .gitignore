@@ -16,6 +16,7 @@ testset.toml
 *.db-wal
 *.db-shm
 *.lock
+!uv.lock
 
 # Audio and renders belong in the library and the local cache, not the repo
 *.wav

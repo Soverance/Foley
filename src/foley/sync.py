@@ -2,15 +2,46 @@
 
 CONTRACT:
 
-    STAGES = ("metadata", "features", "loudness", "caption", "fts")   # Phase 1a
+    CORE_STAGES = ("metadata", "features", "loudness", "caption", "fts")   # Phase 1a
+    MODEL_STAGES = ("tags", "embeddings")                                 # Phase 1b
+    STAGES = CORE_STAGES + MODEL_STAGES
         Each has a version (scan.METADATA_VERSION, features.FEATURES_VERSION,
-        loudness.LOUDNESS_VERSION, captions.CAPTION_VERSION, search.FTS_VERSION).
-        A stage runs for an asset when asset_stages lacks it or its version differs.
+        loudness.LOUDNESS_VERSION, captions.CAPTION_VERSION, search.FTS_VERSION;
+        "tags": TAGS_VERSION + panns.MODEL_KEY; "embeddings": EMBED_VERSION + the sorted
+        model keys of the configured [models] clap checkpoints).
+        A stage runs for an asset when asset_stages lacks it or its version differs;
+        "embeddings" is current when its recorded EMBED_VERSION matches and its recorded
+        keys include every configured checkpoint, and only the missing checkpoints are
+        computed (so dropping a checkpoint from [models] clap re-runs nothing).
         All stages needing audio share one read_bytes + decode per file.
         (Files over LARGE_FILE_BYTES: streamed hash + decode.decode_path instead.)
 
+        `active` is gated by CORE_STAGES only: an asset is active once they are
+        current. The model stages are enrichment that fills in afterwards (resumable,
+        per file); their progress is in status.catalog_status()["models"]. A plain
+        `foley index` runs STAGES when [models] enabled (default), else CORE_STAGES;
+        `--stage tags` / `--stage embeddings` always work. If a model cannot be loaded
+        (no weights, download failure, broken torch), its stage is skipped for the run
+        with a note, before any file is read for it; the core stages proceed.
+        "tags" writes the tags rows (every AudioSet label >= panns.TAG_MIN_SCORE,
+        replacing the asset's previous tags) and features.is_music, and rewrites the
+        asset's caption and search_fts row in the same transaction (their stage rows are
+        left as they were). The caption stage reads the asset's stored tags.
+        "embeddings" writes one embeddings row per computed checkpoint (other
+        checkpoints' rows are kept). A content change drops the asset's tags, embeddings
+        and is_music along with its stage records.
+        Model inference runs in this (the indexer) process on [models] device (auto =
+        CUDA when available); workers only decode and cut the windows
+        (foley.models.prep). In the parallel path, files are inferred in batches of up
+        to MODEL_BATCH_FILES (each file still commits in its own transaction afterwards;
+        a Ctrl+C loses at most the uncommitted batch, which stays pending). A model
+        failure on one file is recorded as that file's error (counted in `errors`) but
+        its core results still commit and its status is unaffected.
+
     @dataclass RunSummary: run_id, scanned, added, changed, moved, missing, analyzed,
-                           errors, settling, archives, interrupted: bool
+                           errors, settling, archives, interrupted: bool,
+                           notes: list[str] (e.g. a model that could not be loaded; also
+                           stored in index_runs.note)
 
     run_index(cfg, stages: list[str] | None = None, force: bool = False,
               limit: int | None = None, progress: Callable[[str], None] | None = None,
@@ -61,7 +92,7 @@ Implementation notes (not contract):
     caption, fts) re-run for it; features and loudness do not.
   * Each file's results, stage records and status change commit in one transaction,
     so a crash or Ctrl+C mid-file leaves that asset exactly as it was (pending).
-  * An asset becomes `active` once every stage in STAGES is current.
+  * An asset becomes `active` once every stage in CORE_STAGES is current.
   * Paths under a directory that could not be listed are never marked missing.
   * prune(dry_run=False) takes the index lock and raises IndexLocked if an index runs.
   * The lock is an OS-level lock on data_dir/index.lock held for the whole run (see
@@ -90,13 +121,21 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import xxhash
 
 from foley import captions, decode, features, loudness, scan, search
 from foley.catalog import db
-from foley.config import Config, check_data_dir
+from foley.config import Config, check_data_dir, clap_checkpoints
+from foley.models import clap as clap_models
+from foley.models import panns, prep
 
-STAGES = ("metadata", "features", "loudness", "caption", "fts")
+CORE_STAGES = ("metadata", "features", "loudness", "caption", "fts")
+MODEL_STAGES = ("tags", "embeddings")
+STAGES = CORE_STAGES + MODEL_STAGES
+TAGS_VERSION = "2"  # windowing / padding / aggregation (2: pad only below 0.31 s)
+EMBED_VERSION = "2"  # windowing / pooling (2: fused checkpoints flag every window)
+MODEL_BATCH_FILES = 16
 
 # Stages whose output depends on the path (re-run when an asset is moved).
 _PATH_STAGES = ("metadata", "caption", "fts")
@@ -157,17 +196,59 @@ class RunSummary:
     settling: int = 0
     archives: int = 0
     interrupted: bool = False
+    notes: list[str] = field(default_factory=list)
 
 
-def stage_versions() -> dict[str, str]:
-    """Current version of every stage (read at call time so upgrades are picked up)."""
+def _clap_keys(cfg: Config | None) -> list[str]:
+    names = clap_checkpoints(cfg) if cfg is not None else list(clap_models.CLAP_CHECKPOINTS)
+    return [clap_models.model_key(n) for n in names]
+
+
+def embed_version(keys) -> str:
+    return f"{EMBED_VERSION}|{','.join(sorted(set(keys)))}"
+
+
+def _embed_keys(version: str | None) -> set[str] | None:
+    """The model keys recorded in an embeddings stage version (None: other EMBED_VERSION)."""
+    if not version or "|" not in version:
+        return None
+    head, _, keys = version.partition("|")
+    if head != EMBED_VERSION:
+        return None
+    return {k for k in keys.split(",") if k}
+
+
+def stage_versions(cfg: Config | None = None) -> dict[str, str]:
+    """Current version of every stage (read at call time so upgrades are picked up).
+    The embeddings version lists cfg's [models] clap checkpoints (all known ones when
+    cfg is None)."""
     return {
         "metadata": scan.METADATA_VERSION,
         "features": features.FEATURES_VERSION,
         "loudness": loudness.LOUDNESS_VERSION,
         "caption": captions.CAPTION_VERSION,
         "fts": search.FTS_VERSION,
+        "tags": f"{TAGS_VERSION}|{panns.MODEL_KEY}",
+        "embeddings": embed_version(_clap_keys(cfg)),
     }
+
+
+def stage_current(stage: str, stored: str | None, versions: dict[str, str]) -> bool:
+    """Whether a recorded stage version satisfies the current one (see STAGES)."""
+    if stage == "embeddings":
+        want = _embed_keys(versions[stage]) or set()
+        if not want:
+            return True  # no checkpoint configured: nothing to compute
+        have = _embed_keys(stored)
+        return have is not None and want <= have
+    return stored == versions[stage]
+
+
+def clap_keys_needed(stored: str | None, versions: dict[str, str], force: bool) -> list[str]:
+    """Configured CLAP model keys an asset still needs (all of them when forced)."""
+    want = sorted(_embed_keys(versions["embeddings"]) or ())
+    have = None if force else _embed_keys(stored)
+    return [k for k in want if have is None or k not in have]
 
 
 # --------------------------------------------------------------------------- lock
@@ -419,7 +500,10 @@ def run_index(
     allow_mass_missing: bool = False,
     workers: int | None = None,
 ) -> RunSummary:
-    requested = list(dict.fromkeys(stages)) if stages else list(STAGES)
+    if stages:
+        requested = list(dict.fromkeys(stages))
+    else:
+        requested = list(STAGES if getattr(cfg, "models_enabled", True) else CORE_STAGES)
     unknown = [s for s in requested if s not in STAGES]
     if unknown:
         raise ValueError(f"unknown stage(s) {unknown}; valid stages: {', '.join(STAGES)}")
@@ -471,6 +555,9 @@ def _run(cfg, conn, requested, force, limit, prog: _Progress, allow_mass_missing
         note = f"{type(e).__name__}: {e}"[:1000]
         raise
     finally:
+        if summary.notes:
+            extra = "; ".join(summary.notes)
+            note = f"{note}; {extra}" if note else extra
         _save_run(conn, summary, status, note)
     return summary
 
@@ -520,7 +607,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
             "`foley index --allow-mass-missing`."
         )
 
-    versions = stage_versions()
+    versions = stage_versions(cfg)
     now = db.utcnow()
     now_ns = time.time_ns()
     settle_ns = int(cfg.settle_minutes * 60 * 1e9)
@@ -577,7 +664,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
 
     def all_current(asset_id: int) -> bool:
         done = stage_map.get(asset_id, {})
-        return all(done.get(s) == versions[s] for s in STAGES)
+        return all(stage_current(s, done.get(s), versions) for s in CORE_STAGES)
 
     work: list[_Work] = []
     with db.transaction(conn):
@@ -602,7 +689,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
             )
             needed = {
                 st for st in requested
-                if force or stage_map.get(row["id"], {}).get(st) != versions[st]
+                if force or not stage_current(st, stage_map.get(row["id"], {}).get(st), versions)
             }
             if needed:
                 work.append(_Work(row["id"], f.rel_path, needed, False))
@@ -622,6 +709,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
                 (f.size_bytes, f.mtime_ns, f.ext, row["id"]),
             )
             conn.execute("DELETE FROM asset_stages WHERE asset_id=?", (row["id"],))
+            _drop_model_outputs(conn, row["id"])
             stage_map.pop(row["id"], None)
         for row in reappeared:
             conn.execute(
@@ -661,7 +749,7 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
             work.append(_Work(aid, f.rel_path, set(requested), False))
             continue
         done = stage_map.get(aid, {})
-        needed = {s for s in requested if force or done.get(s) != versions[s]}
+        needed = {s for s in requested if force or not stage_current(s, done.get(s), versions)}
         status = "pending" if aid in reappeared_ids else row["status"]
         if needed:
             candidate = row["content_hash"] is None and row["indexed_at"] is None and not done
@@ -705,9 +793,222 @@ def default_workers() -> int:
     return max(1, min((os.cpu_count() or 1) - 2, 8))
 
 
+class _Models:
+    """The loaded tagger / CLAP embedders for one run, in this process.
+
+    prefetch() runs one batched inference over several files' windows; outputs() hands
+    a file its (prefetched or freshly computed) results at commit time."""
+
+    def __init__(self, cfg, versions, force, prog: _Progress):
+        self.cfg, self.versions, self.force, self.prog = cfg, versions, force, prog
+        self.device: str | None = None
+        self.tagger = None
+        self.clap: dict = {}  # model key -> embedder
+        self.notes: list[str] = []
+        self._errors: list[str] = []
+        self._pre: dict[int, dict] = {}
+        self.tagged = 0
+        self.embedded = 0
+        self.infer_s = 0.0
+        self.extractor_configs: dict[str, dict] = {}  # config id -> config, for workers
+
+    def _note(self, text: str) -> None:
+        self.notes.append(text)
+        self.prog.say(f"warning: {text}")
+
+    def load(self, wanted: set[str]) -> set[str]:
+        """Load the models for `wanted` stages; returns the stages that cannot run."""
+        from foley import models as m
+
+        try:
+            self.device = m.resolve_device(self.cfg.models_device)
+        except Exception as e:  # noqa: BLE001
+            self._note(f"model stages skipped this run: {e}")
+            return set(wanted)
+        f = m.factory()
+        disabled: set[str] = set()
+        if "tags" in wanted:
+            t0 = time.monotonic()
+            try:
+                self.tagger = f.tagger(self.cfg, self.device)
+                self.prog.say(f"loaded {self.tagger.key} on {self.device} "
+                              f"in {time.monotonic() - t0:.1f}s")
+            except Exception as e:  # noqa: BLE001 - any load failure skips the stage
+                disabled.add("tags")
+                self._note(f"tags skipped this run: {type(e).__name__}: {e}"[:500])
+        if "embeddings" in wanted:
+            for name in clap_checkpoints(self.cfg):
+                t0 = time.monotonic()
+                try:
+                    emb = f.clap_audio(name, self.device)
+                    self.clap[emb.key] = emb
+                    self.prog.say(f"loaded {emb.key} on {self.device} "
+                                  f"in {time.monotonic() - t0:.1f}s")
+                except Exception as e:  # noqa: BLE001
+                    self._note(f"CLAP {name} skipped this run: {type(e).__name__}: {e}"[:500])
+            if not self.clap:
+                disabled.add("embeddings")
+        for emb in self.clap.values():
+            cid = getattr(emb, "config_id", None)
+            if cid is not None and cid not in _CLAP_EXTRACTORS:
+                _CLAP_EXTRACTORS[cid] = emb.extractor  # this process's own extractions
+                self.extractor_configs[cid] = clap_models.extractor_config(emb.extractor)
+        self._reset_peak()
+        return disabled
+
+    def close(self) -> None:
+        _CLAP_EXTRACTORS.clear()
+
+    def _embed(self, emb, results: list[dict]):
+        """Embed several files' CLAP inputs (worker features when present, else windows)."""
+        cid = getattr(emb, "config_id", None)
+        if all("clap_feats" in r and cid in r["clap_feats"] for r in results):
+            return self._timed(emb.embed_features, [r["clap_feats"][cid] for r in results])
+        if all("clap" in r for r in results):
+            return self._timed(emb.embed, [r["clap"] for r in results])
+        raise RuntimeError(f"no CLAP input for {emb.key} (features were computed for "
+                           "another extractor)")
+
+    def active(self) -> bool:
+        return self.tagger is not None or bool(self.clap)
+
+    def _reset_peak(self) -> None:
+        if self.device and self.device.startswith("cuda"):
+            try:
+                import torch
+
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _peak_mb(self) -> float | None:
+        if not (self.device and self.device.startswith("cuda")):
+            return None
+        try:
+            import torch
+
+            return torch.cuda.max_memory_allocated() / 2**20
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _timed(self, fn, *args):
+        t0 = time.monotonic()
+        try:
+            return fn(*args)
+        finally:
+            self.infer_s += time.monotonic() - t0
+
+    def _keys_for(self, stored: str | None) -> list[str]:
+        return [k for k in clap_keys_needed(stored, self.versions, self.force) if k in self.clap]
+
+    def prefetch(self, conn, entries: list[tuple[int, dict]]) -> None:
+        """Batched inference for several files; failures fall back to per-file later."""
+        if self.tagger is not None:
+            idx = [i for i, (_, r) in enumerate(entries) if "panns" in r]
+            if idx:
+                try:
+                    scores = self._timed(self.tagger.tag, [entries[i][1]["panns"] for i in idx])
+                    for i, s in zip(idx, scores, strict=True):
+                        self._pre.setdefault(entries[i][0], {})["tags"] = s
+                except Exception:  # noqa: BLE001 - retried file by file in outputs()
+                    pass
+        if self.clap:
+            need = {
+                aid: self._keys_for(_stage_version(conn, aid, "embeddings"))
+                for aid, r in entries if _has_clap_input(r)
+            }
+            for key, emb in self.clap.items():
+                idx = [i for i, (aid, _) in enumerate(entries) if key in need.get(aid, ())]
+                if not idx:
+                    continue
+                try:
+                    vecs = self._embed(emb, [entries[i][1] for i in idx])
+                    for i, v in zip(idx, vecs, strict=True):
+                        self._pre.setdefault(entries[i][0], {}).setdefault("emb", {})[key] = v
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def outputs(self, asset_id: int, result: dict, needed, embed_stored: str | None) -> dict:
+        pre = self._pre.pop(asset_id, {})
+        out: dict = {}
+        errors: list[str] = []
+        if "tags" in needed and self.tagger is not None and "panns" in result:
+            scores = pre.get("tags")
+            if scores is None:
+                try:
+                    scores = self._timed(self.tagger.tag, [result["panns"]])[0]
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"tags: {type(e).__name__}: {e}")
+            if scores is not None:
+                out["tags"] = panns.scores_to_tags(scores, self.tagger.labels)
+                out["tags_model"] = self.tagger.key
+                self.tagged += 1
+        if "embeddings" in needed and self.clap and _has_clap_input(result):
+            done: dict = {}
+            for key in self._keys_for(embed_stored):
+                vec = pre.get("emb", {}).get(key)
+                if vec is None:
+                    try:
+                        vec = self._embed(self.clap[key], [result])[0]
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"embeddings {key}: {type(e).__name__}: {e}")
+                        continue
+                done[key] = np.asarray(vec, dtype=np.float32)
+            if done:
+                out["embeddings"] = done
+                self.embedded += 1
+        if errors:
+            out["errors"] = errors
+            self._errors.extend(errors)
+        return out
+
+    def take_errors(self) -> list[str]:
+        errors, self._errors = self._errors, []
+        return errors
+
+    def report(self) -> str:
+        peak = self._peak_mb()
+        return (
+            f"models on {self.device}: tagged {self.tagged} files, embedded {self.embedded} "
+            f"files with {len(self.clap)} CLAP checkpoint(s), {self.infer_s:.1f}s inference"
+            + (f", peak GPU memory {peak:.0f} MiB" if peak is not None else "")
+        )
+
+    def record_provenance(self, conn) -> None:
+        """meta `models`: which checkpoints produced the tags and embeddings rows."""
+        try:
+            current = json.loads(db.get_meta(conn, "models") or "{}")
+            if not isinstance(current, dict):
+                current = {}
+        except ValueError:
+            current = {}
+        if self.tagger is not None:
+            current["tags"] = {
+                "model": self.tagger.key, "checkpoint": panns.CHECKPOINT_NAME,
+                "source": f"https://zenodo.org/records/{panns.ZENODO_RECORD}",
+                "license": "CC-BY-4.0", "min_score": panns.TAG_MIN_SCORE,
+                "music_threshold": panns.MUSIC_THRESHOLD,
+            }
+        emb = current.get("embeddings") if isinstance(current.get("embeddings"), dict) else {}
+        for key in self.clap:
+            name = clap_models.short_name_for_key(key)
+            emb[key] = {
+                "name": name,
+                "repo": clap_models.CLAP_CHECKPOINTS.get(name),
+                "revision": clap_models.REVISIONS.get(name),
+                "license": clap_models.LICENSES.get(name),
+                "windows": f"<= {prep.MAX_WINDOWS} x {prep.WINDOW_S:g} s, mean-pooled",
+            } if name else {"name": None}
+        current["embeddings"] = emb
+        with db.transaction(conn):
+            db.set_meta(conn, "models", json.dumps(current, sort_keys=True))
+
+
 def _handle(cfg, conn, item: _Work, summary: RunSummary, prog: _Progress, gone_ids,
             state: dict, step: Callable[[], int | None]) -> None:
     """Run one file's step (analysis + commit) with the shared error semantics."""
+    if state.get("models") is not None:
+        state["models"].take_errors()  # only this file's model errors are reported below
     try:
         moved_from = step()
     except KeyboardInterrupt:
@@ -739,6 +1040,10 @@ def _handle(cfg, conn, item: _Work, summary: RunSummary, prog: _Progress, gone_i
     else:
         state["read_errors"] = 0
         summary.analyzed += 1
+        models = state.get("models")
+        for reason in models.take_errors() if models is not None else ():
+            summary.errors += 1
+            prog.say(f"  error: {item.rel_path}: {reason}"[:300])
         if moved_from is not None:
             summary.moved += 1
             if item.new_this_run:
@@ -754,15 +1059,30 @@ def _analyze_all(
     cfg, conn, work, requested, force, summary: RunSummary, prog: _Progress, gone_ids: set[int],
     workers: int | None = None,
 ):
+    versions = stage_versions(cfg)
+    models = None
+    wanted = {s for item in work for s in item.needed} & set(MODEL_STAGES)
+    if wanted:
+        models = _Models(cfg, versions, force, prog)
+        disabled = models.load(wanted)
+        if disabled:
+            summary.notes.extend(models.notes)
+            requested = [s for s in requested if s not in disabled]
+            for item in work:
+                item.needed -= disabled
+            work = [item for item in work if item.needed]
+        if not models.active():
+            models = None
+        else:
+            models.record_provenance(conn)
     prog.total = len(work)
     prog.started = time.monotonic()
-    versions = stage_versions()
-    state = {"read_errors": 0}  # consecutive read failures
+    state = {"read_errors": 0, "models": models}  # consecutive read failures, models
     n_workers = default_workers() if workers is None else max(1, int(workers))
 
     def serial(item: _Work) -> None:
         _handle(cfg, conn, item, summary, prog, gone_ids, state,
-                lambda: _analyze(cfg, conn, item, requested, force, versions))
+                lambda: _analyze(cfg, conn, item, requested, force, versions, models=models))
 
     pooled: list[_Work] = []
     if n_workers > 1:
@@ -779,15 +1099,19 @@ def _analyze_all(
                 pooled.append(item)
         if workers is None and len(pooled) <= n_workers:
             pooled = []  # not worth starting processes for a handful of files
-    if not pooled:
-        for item in work:
-            serial(item)
-    else:
-        pooled_ids = {w.asset_id for w in pooled}
-        rest = [w for w in work if w.asset_id not in pooled_ids]
-        with _single_threaded_children():
-            _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
-                      summary, prog, gone_ids, state, serial)
+    try:
+        if not pooled:
+            for item in work:
+                serial(item)
+        else:
+            pooled_ids = {w.asset_id for w in pooled}
+            rest = [w for w in work if w.asset_id not in pooled_ids]
+            with _single_threaded_children():
+                _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
+                          summary, prog, gone_ids, state, serial, models)
+    finally:
+        if models is not None:
+            models.close()
     elapsed = time.monotonic() - prog.started
     if work:
         prog.say(
@@ -795,6 +1119,8 @@ def _analyze_all(
             f"({len(work) / max(elapsed, 1e-6):.1f} files/s), {summary.errors} errors"
             + (f", {n_workers} workers" if pooled else "")
         )
+    if models is not None:
+        prog.say(models.report())
 
 
 # ---- parallel analysis --------------------------------------------------------------
@@ -809,6 +1135,9 @@ def _analyze_all(
 # "module:function" called in each worker after start-up. Tests only (fakes, audit hook).
 WORKER_INIT_HOOK: str | None = None
 _WORKER_MOVES: dict = {}
+# CLAP feature extractors (config id -> extractor) for _compute: set in the workers from
+# the indexer's loaded checkpoints, and in the indexer itself for files it reads.
+_CLAP_EXTRACTORS: dict = {}
 _MAX_TASKS_PER_CHILD = 500
 _WORKER_START_TIMEOUT = 300  # s; first imports can be slow
 
@@ -817,12 +1146,15 @@ class _WorkerFailure(Exception):
     """A worker's non-read failure, already formatted like the serial path's message."""
 
 
-def _worker_init(moves: dict, hook: str | None) -> None:
+def _worker_init(moves: dict, hook: str | None, extractors: dict | None = None) -> None:
     import signal
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the main process handles Ctrl+C
     _WORKER_MOVES.clear()
     _WORKER_MOVES.update(moves)
+    _CLAP_EXTRACTORS.clear()
+    for cid, config in (extractors or {}).items():
+        _CLAP_EXTRACTORS[cid] = clap_models.make_extractor(config)
     if hook:
         import importlib
 
@@ -890,7 +1222,7 @@ def _worker_ping() -> int:
 
 
 def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
-              summary, prog, gone_ids, state, serial) -> None:
+              summary, prog, gone_ids, state, serial, models=None) -> None:
     import multiprocessing
     from collections import deque
     from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -904,7 +1236,9 @@ def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
         for _ in range(2):
             pool = ProcessPoolExecutor(
                 max_workers=size, mp_context=multiprocessing.get_context("spawn"),
-                initializer=_worker_init, initargs=(moves, WORKER_INIT_HOOK),
+                initializer=_worker_init,
+                initargs=(moves, WORKER_INIT_HOOK,
+                          models.extractor_configs if models is not None else {}),
                 max_tasks_per_child=_MAX_TASKS_PER_CHILD,
             )
             try:
@@ -926,12 +1260,29 @@ def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
     suspects: deque = deque()  # in flight when a worker died: retried one at a time
     inflight: dict = {}
     main_items = deque(rest)  # no-read and large files: done here between results
+    deferred: list = []  # (item, outcome) waiting for batched model inference
     cap = 2 * n_workers
     pool = None
+
+    def commit(item, outcome) -> None:
+        _handle(cfg, conn, item, summary, prog, gone_ids, state,
+                _pooled_step(cfg, conn, item, outcome, requested, force, versions, models))
+
+    def flush() -> None:
+        batch = list(deferred)
+        deferred.clear()
+        models.prefetch(conn, [(item.asset_id, outcome[1]) for item, outcome in batch])
+        for item, outcome in batch:
+            commit(item, outcome)
+
     try:
         pool = new_pool(n_workers)
         prog.say(f"analyzing with {n_workers} worker processes")
-        while queue or suspects or inflight or main_items:
+        while queue or suspects or inflight or main_items or deferred:
+            if deferred and (len(deferred) >= MODEL_BATCH_FILES
+                             or not (queue or suspects or inflight)):
+                flush()
+                continue
             if suspects:
                 if not inflight:
                     item = suspects.popleft()
@@ -962,8 +1313,10 @@ def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
                 except BrokenProcessPool:
                     broken.append((item, isolated))
                     continue
-                _handle(cfg, conn, item, summary, prog, gone_ids, state,
-                        _pooled_step(cfg, conn, item, outcome, requested, force, versions))
+                if models is not None and outcome[0] == "ok" and _has_model_input(outcome[1]):
+                    deferred.append((item, outcome))
+                else:
+                    commit(item, outcome)
             if broken:
                 broken += list(inflight.values())
                 inflight.clear()
@@ -982,6 +1335,8 @@ def _run_pool(cfg, conn, pooled, rest, requested, force, versions, n_workers,
         prog.say(f"worker processes unavailable ({e}); continuing in this process")
         if pool is not None:
             _kill_pool(pool)
+        if deferred:
+            flush()
         for item in [*(i for i, _ in inflight.values()), *suspects, *queue, *main_items]:
             serial(item)
     except BaseException:
@@ -999,13 +1354,22 @@ def _raiser(exc: Exception) -> Callable[[], int | None]:
     return step
 
 
-def _pooled_step(cfg, conn, item, outcome, requested, force, versions):
+def _pooled_step(cfg, conn, item, outcome, requested, force, versions, models=None):
     kind = outcome[0]
     if kind == "read":
         return _raiser(LibraryReadError(outcome[1]))
     if kind == "other":
         return _raiser(_WorkerFailure(outcome[1]))
-    return lambda: _analyze(cfg, conn, item, requested, force, versions, result=outcome[1])
+    return lambda: _analyze(cfg, conn, item, requested, force, versions, result=outcome[1],
+                            models=models)
+
+
+def _has_clap_input(result: dict) -> bool:
+    return "clap" in result or "clap_feats" in result
+
+
+def _has_model_input(result: dict) -> bool:
+    return "panns" in result or _has_clap_input(result)
 
 
 def _kill_pool(pool) -> None:
@@ -1134,7 +1498,7 @@ def _metadata_bytes(path: Path) -> bytes:
         return bytes(out)
 
 
-_CONTENT_STAGES = frozenset({"metadata", *_AUDIO_STAGES})  # need the file's bytes
+_CONTENT_STAGES = frozenset({"metadata", *_AUDIO_STAGES, *MODEL_STAGES})  # need the bytes
 
 
 @dataclass(frozen=True)
@@ -1158,7 +1522,7 @@ def _needs_read(needed, content_hash, candidate: bool) -> bool:
 
 
 def _needs_after_move(done: dict, requested, force, versions) -> frozenset:
-    needed = {s for s in requested if force or done.get(s) != versions[s]}
+    needed = {s for s in requested if force or not stage_current(s, done.get(s), versions)}
     return frozenset(needed | (set(_PATH_STAGES) & set(requested)))
 
 
@@ -1205,13 +1569,27 @@ def _compute(job: _Job, resolve_move: Callable[[str], tuple | None]) -> dict:
             metadata = json.loads(stored_metadata) if stored_metadata else None
         except ValueError:
             metadata = None
-    if needed & set(_AUDIO_STAGES):
+    if needed & {*_AUDIO_STAGES, *MODEL_STAGES}:
         if job.large:
             audio = _read(decode.decode_path, path)
         else:
             audio = decode.decode_bytes(data, job.ext)
         data = None
-        out["audio_hash"] = decode.audio_hash(audio)
+        if needed & set(_AUDIO_STAGES):
+            out["audio_hash"] = decode.audio_hash(audio)
+        if "tags" in needed:
+            out["panns"] = prep.panns_windows(audio)
+            out["computed"].append("tags")
+        if "embeddings" in needed:
+            windows = prep.clap_windows(audio)
+            if _CLAP_EXTRACTORS:  # the log-mel features, once per distinct extractor
+                out["clap_feats"] = {
+                    cid: clap_models.extract(ex, windows) for cid, ex in _CLAP_EXTRACTORS.items()
+                }
+            else:
+                out["clap"] = windows
+            del windows
+            out["computed"].append("embeddings")
         if "features" in needed:
             out["features"] = features.compute_features(
                 audio, scan.kind_hint(job.rel_path, metadata)
@@ -1222,6 +1600,29 @@ def _compute(job: _Job, resolve_move: Callable[[str], tuple | None]) -> dict:
             out["computed"].append("loudness")
         del audio
     return out
+
+
+def _stage_version(conn, asset_id: int, stage: str) -> str | None:
+    row = conn.execute(
+        "SELECT version FROM asset_stages WHERE asset_id=? AND stage=?", (asset_id, stage)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _stored_tags(conn, asset_id: int) -> list[tuple[str, float]]:
+    return [
+        (r[0], r[1]) for r in conn.execute(
+            "SELECT label, score FROM tags WHERE asset_id=? ORDER BY score DESC, label",
+            (asset_id,),
+        )
+    ]
+
+
+def _drop_model_outputs(conn, asset_id: int) -> None:
+    """The asset's bytes changed: its tags, embeddings and is_music describe old audio."""
+    conn.execute("DELETE FROM tags WHERE asset_id=?", (asset_id,))
+    conn.execute("DELETE FROM embeddings WHERE asset_id=?", (asset_id,))
+    conn.execute("UPDATE features SET is_music=NULL WHERE asset_id=?", (asset_id,))
 
 
 def _live_move_resolver(conn, rel, requested, force, versions):
@@ -1240,7 +1641,7 @@ def _live_move_resolver(conn, rel, requested, force, versions):
 
 
 def _analyze(cfg, conn, item: _Work, requested, force, versions,
-             result: dict | None = None) -> int | None:
+             result: dict | None = None, models: _Models | None = None) -> int | None:
     """Analyze one file (or take a worker's `result`) and commit it in one transaction.
     Returns the re-pointed asset id for a move."""
     row = conn.execute("SELECT * FROM assets WHERE id=?", (item.asset_id,)).fetchone()
@@ -1310,13 +1711,31 @@ def _analyze(cfg, conn, item: _Work, requested, force, versions,
             new_feats.update(result["features"])
         if "loudness" in needed:
             new_feats.update(result["loudness"])
+    # Model stages: inference (or a batch's prefetched output) for what is still needed.
+    model_out: dict = {}
+    embed_stored = None
+    if needed & set(MODEL_STAGES):
+        if not content_changed:
+            embed_stored = _stage_version(conn, asset_id, "embeddings")
+        if models is not None and result is not None:
+            model_out = models.outputs(item.asset_id, result, needed, embed_stored)
     result = None
     feats.update({k: v for k, v in new_feats.items() if k in FEATURE_COLUMNS})
+    tags_now = model_out.get("tags")
+    if tags_now is not None:
+        feats["is_music"] = panns.is_music(tags_now)
+    elif content_changed:
+        feats["is_music"] = None
 
     caption = None
-    if "caption" in needed:
-        caption = captions.templated_caption(asset_view, feats, [], metadata)
-
+    if "caption" in needed or tags_now is not None:
+        if tags_now is not None:
+            tag_list = tags_now
+        elif content_changed:
+            tag_list = []
+        else:
+            tag_list = _stored_tags(conn, asset_id)
+        caption = captions.templated_caption(asset_view, feats, tag_list, metadata)
 
     now = db.utcnow()
     with db.transaction(conn):
@@ -1332,6 +1751,7 @@ def _analyze(cfg, conn, item: _Work, requested, force, versions,
             # Every stage's output describes the old bytes: drop them all, so stages not
             # requested in this run are redone later instead of looking current.
             conn.execute("DELETE FROM asset_stages WHERE asset_id=?", (asset_id,))
+            _drop_model_outputs(conn, asset_id)
             if ahash is None:
                 conn.execute("UPDATE assets SET audio_hash=NULL WHERE id=?", (asset_id,))
         conn.execute(
@@ -1352,31 +1772,62 @@ def _analyze(cfg, conn, item: _Work, requested, force, versions,
                 f"VALUES ({', '.join('?' * len(cols))})",
                 (asset_id, *(values.get(c) for c in FEATURE_COLUMNS)),
             )
+        elif tags_now is not None:
+            conn.execute(
+                "INSERT INTO features(asset_id, is_music) VALUES (?, ?) "
+                "ON CONFLICT(asset_id) DO UPDATE SET is_music=excluded.is_music",
+                (asset_id, feats["is_music"]),
+            )
+        done_now = [(s, versions[s]) for s in CORE_STAGES if s in needed and s != "fts"]
+        if tags_now is not None:
+            conn.execute("DELETE FROM tags WHERE asset_id=?", (asset_id,))
+            conn.executemany(
+                "INSERT INTO tags(asset_id, label, score, model) VALUES (?, ?, ?, ?)",
+                [(asset_id, label, score, model_out["tags_model"]) for label, score in tags_now],
+            )
+            done_now.append(("tags", versions["tags"]))
+        if "embeddings" in model_out:
+            conn.executemany(
+                "INSERT OR REPLACE INTO embeddings(asset_id, model, dim, vector) "
+                "VALUES (?, ?, ?, ?)",
+                [(asset_id, key, int(vec.shape[0]), vec.astype("<f4").tobytes())
+                 for key, vec in model_out["embeddings"].items()],
+            )
+            have = _embed_keys(embed_stored) or set()
+            done_now.append(
+                ("embeddings", embed_version(have | set(model_out["embeddings"])))
+            )
         if caption is not None:
             conn.execute(
                 "INSERT OR REPLACE INTO captions(asset_id, model, text) VALUES (?, ?, ?)",
                 (asset_id, captions.CAPTION_MODEL, caption),
             )
-        done_now = [s for s in STAGES if s in needed and s != "fts"]
-        if "fts" in needed:
+        if "fts" in needed or tags_now is not None:
             search.index_asset(conn, asset_id)
-            done_now.append("fts")
+        if "fts" in needed:
+            done_now.append(("fts", versions["fts"]))
         conn.executemany(
             "INSERT OR REPLACE INTO asset_stages(asset_id, stage, version, done_at) "
             "VALUES (?, ?, ?, ?)",
-            [(asset_id, s, versions[s], now) for s in done_now],
+            [(asset_id, s, v, now) for s, v in done_now],
         )
         current = {
             r[0]: r[1] for r in conn.execute(
                 "SELECT stage, version FROM asset_stages WHERE asset_id=?", (asset_id,)
             )
         }
-        complete = all(current.get(s) == versions[s] for s in STAGES)
+        complete = all(stage_current(s, current.get(s), versions) for s in CORE_STAGES)
         conn.execute(
             "UPDATE assets SET status=?, error=NULL, error_count=0, "
             "indexed_at=CASE WHEN ? THEN ? ELSE indexed_at END WHERE id=?",
             ("active" if complete else "pending", complete, now, asset_id),
         )
+        if model_out.get("errors"):
+            reason = "; ".join(model_out["errors"])
+            conn.execute(
+                "UPDATE assets SET error=?, error_count=error_count+1 WHERE id=?",
+                (reason[:1000], asset_id),
+            )
     return None if target is None else asset_id
 
 

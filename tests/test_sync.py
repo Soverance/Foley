@@ -102,7 +102,7 @@ def _make_fakes(record) -> dict:
 
     def templated_caption(asset, feats, tags, metadata):
         record("caption")
-        assert tags == []
+        assert all(isinstance(t, tuple) and len(t) == 2 for t in tags)
         return f"caption for {asset['rel_path']} ({feats.get('lufs_integrated')} LUFS)"
 
     def index_asset(conn, asset_id):
@@ -155,9 +155,14 @@ class CallCounts:
 
 def install_fakes(monkeypatch) -> CallCounts:
     """Replace every sibling pipeline function with a fast fake; returns call counts."""
+    from _fake_models import FakeFactory
+
+    from foley import models
+
     calls = CallCounts()
     for (module, name), fn in _make_fakes(calls.record).items():
         monkeypatch.setattr(module, name, fn)
+    models.set_factory(FakeFactory())  # model stages run too (conftest restores the default)
     # fakes live in this process only: analyze in-process unless a test opts in
     monkeypatch.setattr(sync, "run_index", functools.partial(_REAL_RUN_INDEX, workers=1))
     return calls
@@ -302,7 +307,7 @@ def test_second_run_is_a_no_op(cfg, fakes):
 
 def test_unknown_stage_rejected(cfg, fakes):
     with pytest.raises(ValueError, match="unknown stage"):
-        sync.run_index(cfg, stages=["tags"])
+        sync.run_index(cfg, stages=["nope"])
 
 
 # --------------------------------------------------------------------------- rules table

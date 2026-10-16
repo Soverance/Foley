@@ -71,7 +71,8 @@ def cmd_search(cfg, args) -> int:
 
     with db.open_catalog(cfg) as conn:
         result = search.search(
-            conn, " ".join(args.query), _filters(args), project=args.project, limit=args.limit
+            conn, " ".join(args.query), _filters(args), project=args.project, limit=args.limit,
+            settings=search.SearchSettings.from_config(cfg),
         )
     if args.json:
         _print_json(result)
@@ -81,10 +82,51 @@ def cmd_search(cfg, args) -> int:
     for r in result["results"]:
         lufs = f"{r['lufs']:.1f} LUFS" if r.get("lufs") is not None else "short"
         dur = f"{r['duration_s']:.2f}s" if r.get("duration_s") is not None else "?"
+        sim = f"  sim {r['similarity']:.2f}" if r.get("similarity") is not None else ""
         print(f"[{r['id']}] {r['path']}")
-        print(f"      {dur}  {lufs}  {r.get('caption') or ''}")
+        print(f"      {dur}  {lufs}{sim}  {r.get('caption') or ''}")
     if not result["results"]:
         print("no results")
+    return 0
+
+
+def cmd_eval(cfg, args) -> int:
+    from foley import evaluate
+
+    try:
+        weights = [float(w) for w in args.weights.split(",") if w.strip()] \
+            if args.weights else None
+    except ValueError:
+        print(f"foley: --weights must be comma-separated numbers, got {args.weights!r}",
+              file=sys.stderr)
+        return 2
+    conn = db.open_catalog(cfg)
+    try:
+        try:
+            report = evaluate.run(cfg, conn, args.testset, clap=args.clap, weights=weights,
+                                  k=args.k, progress=None if args.json else print)
+        except evaluate.EvalError as e:
+            print(f"foley: {e}", file=sys.stderr)
+            return 2
+        path = evaluate.write_report(cfg, report)
+        adopted = evaluate.adopt(conn, report) if args.adopt else None
+    finally:
+        conn.close()
+    if args.json:
+        _print_json({**report, "adopted": adopted})
+        return 0
+    print(evaluate.format_report(report))
+    print(f"report: {path}")
+    if adopted:
+        print(f"adopted: meta search_clap_model={adopted['clap_model']}, "
+              f"search_blend_weight={adopted['blend_weight']:g}")
+        for key, name in (("search_blend_weight", "blend_weight"),
+                          ("search_clap_model", "clap_model")):
+            if getattr(cfg, key) is not None:
+                print(f"note: [search] {name} in {cfg.source or 'foley.toml'} overrides the "
+                      "adopted value; remove it to use the adopted one")
+    elif report["best"]:
+        print("run with --adopt to record the recommendation in the catalog's meta table")
     return 0
 
 
@@ -192,7 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("index", help="sync the catalog with the library and analyze new files")
-    s.add_argument("--stage", action="append", help="only run this stage (repeatable)")
+    s.add_argument(
+        "--stage", action="append",
+        help="only run this stage (repeatable): metadata, features, loudness, caption, fts, "
+        "tags, embeddings",
+    )
     s.add_argument("--force", action="store_true", help="re-run the stages even if current")
     s.add_argument("--limit", type=int, help="analyze at most N files (trial runs)")
     s.add_argument(
@@ -220,6 +266,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("eval", help="score search on the test set (keyword-only vs hybrid)")
+    s.add_argument("--testset", help="test set TOML (default: [eval] testset)")
+    s.add_argument("--clap", nargs="+", action="extend", metavar="NAME",
+                   help="CLAP checkpoints to compare (default: every one with embeddings)")
+    s.add_argument("--weights", metavar="W,W,...",
+                   help="blend weights to sweep (default 0,0.1,...,1; 0 = keyword-only)")
+    s.add_argument("--k", type=int, default=10, help="a query passes with a good answer in "
+                   "the top k (default 10)")
+    s.add_argument("--adopt", action="store_true",
+                   help="record the best checkpoint and weight in the catalog meta table")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_eval)
 
     s = sub.add_parser("describe", help="full record for one asset (id or relative path)")
     s.add_argument("asset")

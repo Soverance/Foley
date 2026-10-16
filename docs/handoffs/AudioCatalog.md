@@ -302,14 +302,14 @@ Scope: repo scaffold with uv, config, `catalog.db` and `ledger.db` with schema v
 
 ### Phase 1b: semantic search
 
-Before measuring search, Scott writes a **test set**: about 25 text queries typical of Endless Reach, each with 1–3 files he considers good answers. Write it **after** the new Sonniss packs are in the library, or better matches from those packs will look like misses.
+Before measuring search, Scott writes a **test set**: about 25 text queries typical of Endless Reach, each with 1–3 files he considers good answers. Write it **after** the new Sonniss packs are in the library, or better matches from those packs will look like misses. The answers can be marked while listening in `foley browse` (Test set, in the left pane; key `T`), which rewrites the TOML file; find them by browsing folders as well as searching, so the set does not favour keyword search.
 
 Scope: pipeline stages 6–7 (PANNs tags, CLAP embeddings), hybrid search, `find_similar`, `foley eval`.
 
-- [ ] Each model's preprocessing is verified against its reference example code on a few files before indexing the library
+- [x] Each model's preprocessing is verified against its reference example code on a few files before indexing the library *(Oct 16: `eval/verify_models.py` on 8 library files (dog bark, gunshot, rain, music; one ≤10 s and one longer each): for every clip ≤10 s PANNs CNN14 matches the audioset_tagging_cnn inference code to 1e-5 and all three CLAP checkpoints match the Hugging Face ClapModel example (audio cosine 1.0000, text identical); longer files differ only by Foley's 10 s windows (cosine 0.95–0.99 unfused). The check caught and fixed a 1 s zero-pad that wrecked PANNs on sub-second clips and the fused checkpoint's "longer" flag. `-m models` tests repeat the tower and indexer checks.)*
 - [ ] At least 80% of test queries have a good answer in the top 10 results, measured by `foley eval`
-- [ ] `foley eval` reports keyword-only and hybrid scores; CLAP is kept only if hybrid beats keyword-only
-- [ ] Two or three CLAP checkpoints compared on the test set; the winner is recorded in `meta`
+- [ ] `foley eval` reports keyword-only and hybrid scores; CLAP is kept only if hybrid beats keyword-only *(implemented: every checkpoint × blend weight next to keyword-only; `--adopt` records weight 0 when no hybrid config beats keyword-only. Needs a run on the real test set.)*
+- [ ] Two or three CLAP checkpoints compared on the test set; the winner is recorded in `meta` *(`foley eval --adopt` writes `search_clap_model`, `search_blend_weight` and `search_eval`; see docs/schema.md)*
 
 ### Phase 2: the review loop and duplicate cleanup (launch window if Phase 1 is early, else after launch)
 

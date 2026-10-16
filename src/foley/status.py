@@ -12,7 +12,12 @@ CONTRACT:
           archives_not_extracted: [rel_path, ...] (first 20) + count,
           duplicates: {exact_groups, reclaimable_bytes, audio_identical_groups},
           used_but_missing: [{rel_path, project}],   # ledger usages whose asset is missing
-          models: {...} from meta,
+          models: {
+            tags: {model, done, pending},          # active assets tagged by that model
+            embeddings: {<model key>: {name, done, pending}},   # [models] clap, plus any
+                                                   # other model with embeddings rows
+            provenance: {...} from meta `models` (checkpoints, licences),
+          },
           errors: [{rel_path, error}] (first 20) + count,
         }
 
@@ -35,7 +40,7 @@ from datetime import UTC, datetime
 
 from foley import dedupe
 from foley.catalog import db
-from foley.config import Config
+from foley.config import Config, clap_checkpoints
 
 _LIST_LIMIT = 20
 
@@ -77,6 +82,33 @@ def _archives_not_extracted(conn: sqlite3.Connection) -> list[str]:
     return out
 
 
+def _model_progress(cfg: Config, conn: sqlite3.Connection, active: int) -> dict:
+    """How far the model stages (enrichment, not gating `active`) have got."""
+    from foley import sync
+    from foley.models import clap, panns
+
+    versions = sync.stage_versions(cfg)
+    tagged = conn.execute(
+        "SELECT count(*) FROM assets a JOIN asset_stages s ON s.asset_id = a.id "
+        "AND s.stage = 'tags' AND s.version = ? WHERE a.status = 'active'",
+        (versions["tags"],),
+    ).fetchone()[0]
+    have = dict(conn.execute(
+        "SELECT e.model, count(*) FROM embeddings e JOIN assets a ON a.id = e.asset_id "
+        "WHERE a.status = 'active' GROUP BY e.model"
+    ).fetchall())
+    keys = [clap.model_key(n) for n in clap_checkpoints(cfg)]
+    keys += sorted(k for k in have if k not in keys)
+    return {
+        "tags": {"model": panns.MODEL_KEY, "done": tagged, "pending": max(active - tagged, 0)},
+        "embeddings": {
+            k: {"name": clap.short_name_for_key(k), "done": have.get(k, 0),
+                "pending": max(active - have.get(k, 0), 0)}
+            for k in keys
+        },
+    }
+
+
 def catalog_status(cfg: Config, conn: sqlite3.Connection) -> dict:
     counts = {s: 0 for s in ("active", "pending", "missing", "error")}
     for status, n in conn.execute("SELECT status, count(*) FROM assets GROUP BY status"):
@@ -116,9 +148,11 @@ def catalog_status(cfg: Config, conn: sqlite3.Connection) -> dict:
 
     models_raw = db.get_meta(conn, "models")
     try:
-        models = json.loads(models_raw) if models_raw else {}
+        provenance = json.loads(models_raw) if models_raw else {}
     except ValueError:
-        models = {"raw": models_raw}
+        provenance = {"raw": models_raw}
+    models = _model_progress(cfg, conn, counts["active"])
+    models["provenance"] = provenance
 
     errors = [
         {"rel_path": r[0], "error": r[1]}

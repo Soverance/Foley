@@ -73,3 +73,40 @@ def library(tmp_path, _library_template) -> Path:
 @pytest.fixture
 def cfg(tmp_path, library) -> Config:
     return Config(library_root=library, data_dir=tmp_path / "data", settle_minutes=10)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_real_models():
+    """No test loads real weights (or downloads) unless marked `models`: by default model
+    loading fails like on a machine without weights, so `foley index` skips the model
+    stages. Tests of the model stages install fakes (`fake_models` / FakeFactory)."""
+    from _fake_models import UnavailableFactory
+
+    from foley import models
+
+    factory = UnavailableFactory()
+    models.set_factory(factory)
+    yield factory
+    models.set_factory(None)
+
+
+@pytest.fixture(autouse=True)
+def _models_per_test(request, _no_real_models):
+    from foley import models
+
+    real = request.node.get_closest_marker("models") is not None
+    models.set_factory(None if real else _no_real_models)
+    yield
+    models.set_factory(_no_real_models)
+
+
+@pytest.fixture
+def fake_models():
+    """Fake PANNs/CLAP models for this test (CPU, no torch); .calls/.loads record use."""
+    from _fake_models import FakeFactory
+
+    from foley import models
+
+    factory = FakeFactory()
+    models.set_factory(factory)
+    return factory

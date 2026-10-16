@@ -67,7 +67,7 @@ One row per analyzed asset. Units: seconds, Hz, LUFS, dBTP.
 | `band_energy` | JSON shares summing to 1: `sub` <60, `low` 60–250, `low_mid` 250–500, `mid` 500–2k, `upper_mid` 2k–4k, `presence` 4k–6k, `air` >6k Hz |
 | `tempo_bpm` | Music only |
 | `loop_seam_score` | Music and ambience only; lower is a cleaner loop |
-| `is_music` | 0/1 from AudioSet tags; NULL until tagged |
+| `is_music` | 0/1 from AudioSet tags: 1 when the `Music` score is ≥ 0.5. NULL until tagged |
 
 ### tags, captions, embeddings
 
@@ -76,6 +76,12 @@ One row per analyzed asset. Units: seconds, Hz, LUFS, dBTP.
 | `tags` | (`asset_id`, `model`, `label`) | `score` 0–1. AudioSet labels scoring ≥ 0.1 |
 | `captions` | (`asset_id`, `model`) | `text`. `model = 'template-v1'` for templated captions |
 | `embeddings` | (`asset_id`, `model`) | `dim`, `vector`: little-endian float32 BLOB, L2-normalized, so cosine similarity is a dot product |
+
+Tags and embeddings are filled in by `foley index` after an asset is already `active` (they do not gate it), so an active asset may have none yet; `foley status` reports how many are done. Every row names the model that produced it, and a new checkpoint or preprocessing gets a new name:
+
+- **`tags.model`** = `panns:cnn14@zenodo3987831-541141fa`: PANNs CNN14 (`Cnn14_mAP=0.431.pth` from [Zenodo record 3987831](https://zenodo.org/records/3987831), md5 prefix), on 32 kHz mono audio. `label` is the AudioSet display name (e.g. `Music`, `Gunshot, gunfire`). Files longer than 10 s are scored on up to 12 evenly spaced 10 s windows and `score` is the mean over them. Weights: Kong et al. 2020, **CC BY 4.0**; model code MIT; AudioSet labels Google, CC BY 4.0.
+- **`embeddings.model`** = `clap:<Hugging Face repo>@<first 12 hex of the commit>`, e.g. `clap:laion/larger_clap_general@ada0c23a36c4`. Several checkpoints can coexist for one asset (`[models] clap` in `foley.toml` chooses which ones the indexer computes; search uses one, see `search_clap_model` below). `dim` is 512. The vector is the mean of the L2-normalized embeddings of up to 12 evenly spaced 10 s windows at 48 kHz, L2-normalized again. Checkpoints: `laion/larger_clap_general`, `laion/clap-htsat-unfused`, `laion/clap-htsat-fused` (LAION, **Apache-2.0**).
+- Text queries must be embedded with the same checkpoint's text tower (Hugging Face `ClapTextModelWithProjection`, L2-normalized) to be comparable.
 
 ### images
 
@@ -87,10 +93,14 @@ FTS5 table whose `rowid` is `assets.id`. Columns: `name`, `pack`, `category`, `m
 
 ### asset_stages, index_runs, archives, meta
 
-- `asset_stages`: which pipeline stage ran for each asset, at which version.
+- `asset_stages`: which pipeline stage ran for each asset, at which version. Stages: `metadata`, `features`, `loudness`, `caption`, `fts` (an asset is `active` once these are current), then `tags` (version `<n>|<tags model>`) and `embeddings` (version `<n>|<comma-separated model keys computed for the asset>`).
 - `index_runs`: one row per `foley index` run, with counts and `status` (`running`, `completed`, `interrupted`, `failed`).
 - `archives`: `.zip`, `.rar` and `.7z` files found in the library and not indexed.
-- `meta`: `schema_version`, `library_root`, and model provenance as JSON under `models`.
+- `meta`: `schema_version`, `library_root`, and model provenance as JSON under `models`: `{"tags": {model, checkpoint, source, license, min_score, music_threshold}, "embeddings": {<model key>: {name, repo, revision, license, windows}}}`. Search settings recorded by `foley eval --adopt` (no migration: plain key/value rows, absent until the first adopt):
+  - `search_clap_model`: the CLAP checkpoint short name search uses (e.g. `htsat-unfused`), unless `[search] clap_model` in `foley.toml` overrides it. Its embeddings are the `embeddings` rows whose `model` is that checkpoint's model key.
+  - `search_blend_weight`: the hybrid blend weight as a decimal string, `0` to `1`, used when `[search] blend_weight` is unset. `0` means keyword-only search (CLAP did not beat keyword-only on the test set). Consumers blending scores themselves: `score = (1 - w) * keyword + w * vector`, both normalized to 0..1 per query (see `foley.search`).
+  - `search_eval`: JSON summary of the adopted evaluation: `{at, testset, k, queries, keyword: {recall, mrr}, best_hybrid: {clap_model, weight, recall, mrr} | null, report}` (`report` is the JSON report under `<data folder>/eval/`).
+  These are derived settings: a catalog rebuild drops them, and `foley eval --adopt` writes them again.
 
 ## ledger.db
 

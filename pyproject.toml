@@ -19,6 +19,10 @@ dependencies = [
     "pillow>=10.0",
     "matplotlib>=3.8",
     "mcp>=2.3",
+    # Phase 1b models (PANNs CNN14 tags, CLAP embeddings). torch comes from the CUDA
+    # wheel index on Windows and Linux (see [tool.uv.sources]) and from PyPI elsewhere.
+    "torch>=2.6",
+    "transformers>=4.45",
 ]
 
 [project.scripts]
@@ -27,6 +31,27 @@ foley-mcp = "foley.mcp_server:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.5"]
+
+# CUDA 12.6 wheels: built for sm_50 through sm_90, so they run on Turing (sm_75, e.g. an
+# RTX 2070) as well as newer cards, and need an NVIDIA driver >= 560. On a machine
+# without a CUDA GPU these wheels still run on the CPU. macOS gets PyPI's CPU/MPS wheels.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv]
+# torch publishes no wheels for Intel macOS any more; resolve for the platforms it does.
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -39,7 +64,9 @@ packages = ["src/foley"]
 testpaths = ["tests"]
 markers = [
     "nas: needs the real library share (deselect with -m 'not nas')",
+    "models: needs real model weights (downloads on first use; run with -m models)",
 ]
+addopts = "-m 'not models'"
 
 [tool.ruff]
 line-length = 100

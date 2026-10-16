@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import logging.handlers
+import re
 import shutil
 import socket
 import sys
@@ -568,6 +569,76 @@ def test_static_whitelist(env):
                  quote("..\\browse.py"), "/static/", "/static/APP.JS"):
         r, _ = request(server, path)
         assert r.status == 404
+
+
+def test_static_fonts(env):
+    _, server = env
+    fonts = [n for n in browse.STATIC_FILES if n.startswith("fonts/")]
+    assert fonts and all(n.endswith(".woff2") for n in fonts)
+    for name in fonts:
+        assert (browse.UI_DIR / name).is_file(), name
+        r, body = request(server, "/static/" + name)
+        assert r.status == 200 and r.getheader("Content-Type") == "font/woff2"
+        assert body[:4] == b"wOF2"
+    # every family ships its licence next to the fonts
+    for family in ("Michroma", "Barlow", "JetBrainsMono"):
+        text = (browse.UI_DIR / "fonts" / f"{family}-OFL.txt").read_text(encoding="utf-8")
+        assert text.startswith("Copyright") and "SIL OPEN FONT LICENSE Version 1.1" in text
+    # the stylesheet references only whitelisted fonts
+    css = (browse.UI_DIR / "app.css").read_text(encoding="utf-8")
+    refs = set(re.findall(r'url\("(fonts/[^"]+)"\)', css))
+    assert refs and refs <= set(fonts)
+    for path in ("/static/fonts/", "/static/fonts", "/static/fonts/Michroma-OFL.txt",
+                 "/static/fonts/../app.js", "/static/fonts/" + quote("..\\app.js"),
+                 "/static/FONTS/Barlow-400.woff2", "/static/fonts/Barlow-700.woff2",
+                 "/static/fonts//Barlow-400.woff2", "/static/./fonts/Barlow-400.woff2"):
+        r, _ = request(server, path)
+        assert r.status == 404, path
+
+
+def test_brand_files(env, monkeypatch, tmp_path):
+    cfg, server = env
+    # no brand_dir: nothing served, and the status says so
+    assert get_json(server, "/api/status")["brand"] == {"logo": False, "wordmark": False}
+    r, _ = request(server, "/brand/logo.png")
+    assert r.status == 404
+
+    brand = tmp_path / "brand"
+    brand.mkdir()
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+    (brand / "logo.png").write_bytes(png)
+    (brand / "secret.png").write_bytes(png)
+    (brand / "notes.txt").write_text("private")
+    (tmp_path / "outside.png").write_bytes(png)
+    (brand / "wordmark.png").mkdir()  # a folder is not a file
+    monkeypatch.setattr(cfg, "browse_brand_dir", brand)
+
+    assert get_json(server, "/api/status")["brand"] == {"logo": True, "wordmark": False}
+    r, body = request(server, "/brand/logo.png")
+    assert r.status == 200 and r.getheader("Content-Type") == "image/png" and body == png
+    for path in ("/brand/wordmark.png", "/brand/secret.png", "/brand/notes.txt",
+                 "/brand/", "/brand/../outside.png", "/brand/" + quote("..\\outside.png"),
+                 "/brand/LOGO.PNG", "/brand/logo.png/", "/brand//logo.png",
+                 "/brand/" + quote(str(tmp_path / "outside.png"))):
+        r, _ = request(server, path)
+        assert r.status == 404, path
+
+    (brand / "wordmark.png").rmdir()
+    (brand / "wordmark.png").write_bytes(png)
+    assert get_json(server, "/api/status")["brand"] == {"logo": True, "wordmark": True}
+    r, body = request(server, "/brand/wordmark.png")
+    assert r.status == 200 and body == png
+
+
+def test_brand_dir_config(tmp_path):
+    from foley import config
+
+    cfg = config.from_dict({"library": {"root": str(tmp_path)},
+                            "browse": {"brand_dir": str(tmp_path / "brand")}})
+    assert cfg.browse_brand_dir == tmp_path / "brand"
+    assert config.from_dict({"library": {"root": str(tmp_path)}}).browse_brand_dir is None
+    with pytest.raises(config.ConfigError):
+        config.from_dict({"library": {"root": str(tmp_path)}, "browse": {"brand_dir": 3}})
 
 
 def test_placeholder_when_ui_missing(env, monkeypatch, tmp_path):

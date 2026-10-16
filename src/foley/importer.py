@@ -4,7 +4,7 @@ CONTRACT:
 
     load_project_config(project_root: Path) -> dict
         Reads <project_root>/foley.project.toml if present:
-          [project] name = "endless-reach"
+          [project] name = "my-game"
           [loudness] oneshot_peak_db = -3.0
           [loudness.targets]  "sfx.ui" = -20.0, "sfx.weapon" = -14.0, "music" = -16.0
           [review] hero_slots = ["music.title", "sfx.boss.*"]

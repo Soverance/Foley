@@ -8,6 +8,7 @@ import sys
 import time
 from unittest.mock import patch
 
+import _fake_clap as fc
 import pytest
 from _catalog_builder import add_asset
 
@@ -44,6 +45,7 @@ def test_tools_registered_with_claude_facing_descriptions(server):
     tools = {t.name: t for t in run(server.list_tools())}
     assert set(tools) == {
         "search_audio",
+        "find_similar",
         "describe",
         "render_comparison",
         "import_to_project",
@@ -57,6 +59,10 @@ def test_tools_registered_with_claude_facing_descriptions(server):
         and "seconds" in tools["search_audio"].description
     )
     assert "Read tool" in tools["render_comparison"].description
+    assert "CLAP" in tools["find_similar"].description
+    assert tools["find_similar"].input_schema["required"] == ["asset_id"]
+    assert {"max_duration_s", "is_music", "project", "limit"} <= set(
+        tools["find_similar"].input_schema["properties"])
     assert "dBTP" in tools["import_to_project"].description
     props = tools["search_audio"].input_schema["properties"]
     assert {
@@ -104,6 +110,31 @@ def test_errors_are_concise_tool_errors(server):
     with pytest.raises(mcp_server.ToolError, match="not available"):
         with patch.object(status, "catalog_status", side_effect=NotImplementedError):
             mcp_server.tool_catalog_status()
+
+
+def test_hybrid_search_and_find_similar_through_server(server, cfg, monkeypatch):
+    fc.install(monkeypatch)
+    conn = db.open_catalog(cfg)
+    ids = {r[1]: r[0] for r in conn.execute("SELECT id, rel_path FROM assets")}
+    fc.add_embedding(conn, ids["sfx/NailScratch19.wav"], "nail scratch metal")
+    fc.add_embedding(conn, ids["music/Battle Loop.mp3"], "orchestral drums battle")
+    other = add_asset(conn, "sfx/zz_01.wav", features={"duration_s": 0.5, "is_music": 0})
+    fc.add_embedding(conn, other, "metal nail scratch screech")
+    conn.close()
+    data = payload(run(server.call_tool("search_audio", {"query": "metal screech"})))
+    assert data["mode"] == "hybrid" and data["model"] == "fake-a"
+    assert "sfx/zz_01.wav" in [r["path"] for r in data["results"]]
+    sim = payload(run(server.call_tool(
+        "find_similar", {"asset_id": ids["sfx/NailScratch19.wav"], "is_music": False})))
+    assert [r["path"] for r in sim["results"]] == ["sfx/zz_01.wav"]
+    assert sim["results"][0]["similarity"] > 0.5
+    assert sim["source"]["id"] == ids["sfx/NailScratch19.wav"]
+    with pytest.raises(mcp_server.ToolError, match="no such asset"):
+        mcp_server.tool_find_similar(99999)
+    # [search] blend_weight from the config reaches search: 0 = keyword only, no note
+    cfg.search_blend_weight = 0.0
+    data = mcp_server.tool_search_audio("metal screech")
+    assert data["mode"] == "keyword" and data["note"] is None
 
 
 def test_tool_error_over_protocol_has_no_traceback(server):

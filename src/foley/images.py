@@ -14,7 +14,8 @@ CONTRACT:
           true peak. Top: waveform (mono, linear -1..1) with RMS envelope.
           Bottom: log-mel spectrogram, 128 mel bands, 20 Hz to Nyquist (of a fixed
           analysis rate, 48 kHz -> 24 kHz, so all images share a y axis),
-          fixed -80..0 dB range, one fixed colormap. Time axis labelled in seconds.
+          fixed -80..0 dB range, one fixed colormap (CMAP_STOPS). Time axis labelled
+          in seconds. Dark navy theme matching the `foley browse` UI.
 
     OVERVIEW_PLOT_X: tuple[float, float]
         Horizontal fractions of the overview PNG (0 = left edge, 1 = right edge) where
@@ -33,13 +34,15 @@ CONTRACT:
         (the longest clip) so durations compare visually.
 
 Notes on the scales (identical in overviews and grids):
-    * Waveform y is fixed at -1..1 (linear); dashed lines mark -6 dBFS (0.5) and
-      -20 dBFS (0.1). The orange line is the RMS envelope (mirrored).
-    * Spectrogram level is dBFS, 0 dB = a full-scale sine, clipped to -80..0, magma
-      colormap (black = silence, white/yellow = loud). Rows are 128 mel bands from
-      20 Hz to 24 kHz, labelled in Hz.
+    * Waveform y is fixed at -1..1 (linear), drawn in cyan; dashed lines mark -6 dBFS
+      (0.5) and -20 dBFS (0.1). The orange line is the RMS envelope (mirrored).
+    * Spectrogram level is dBFS, 0 dB = a full-scale sine, clipped to -80..0, with a
+      custom colormap (CMAP_STOPS): near-black navy = silence (-80), through deep blue
+      and blue to cyan, white = loud (0). Rows are 128 mel bands from 20 Hz to 24 kHz,
+      labelled in Hz.
     * In grids the time axis spans the longest clip; the region past the end of a
-      shorter clip is filled slate grey (not black, which means digital silence).
+      shorter clip is a lighter navy with faint diagonal hatching and an "end" line
+      (not the colormap's navy-black, which means digital silence).
     * Grids are always re-rendered (cheap) and named from the ordered ids.
     * Errors (unknown id, missing file, wrong id count) raise ValueError.
 """
@@ -57,7 +60,7 @@ from foley import decode
 from foley.catalog import db
 from foley.config import Config
 
-IMAGE_VERSION = "1"
+IMAGE_VERSION = "2"
 
 ANALYSIS_SR = 48000
 N_MELS = 128
@@ -65,14 +68,18 @@ FMIN = 20.0
 FMAX = 24000.0
 N_FFT = 2048
 DB_MIN, DB_MAX = -80.0, 0.0
-CMAP = "magma"
+# Spectrogram colormap: (level 0..1 over DB_MIN..DB_MAX, colour). Changing it must bump
+# IMAGE_VERSION and the colour descriptions in the module docstring and mcp_server.
+CMAP_STOPS = ((0.0, "#03060f"), (0.30, "#0e165c"), (0.55, "#2a4be0"), (0.80, "#3fd0ff"),
+              (1.0, "#ecfcff"))
 
-_BG = "#14161a"
-_FG = "#e8e8e8"
-_PAST_END = "#4b5563"
-_WAVE = "#6cb6ff"
-_RMS = "#ff9f1c"
-_GRID = "#c9d1d9"
+_BG = "#03061a"
+_FG = "#a9bedb"
+_PAST_END = "#0a1534"
+_WAVE = "#5fd4ff"
+_RMS = "#ff7a3d"
+_GRID = "#5fd4ff"  # always drawn at low alpha
+_GRID_SOFT = "#5fd4ff59"  # spines and outlines (alpha .35)
 
 OVERVIEW_W, OVERVIEW_H = 1024, 512
 MIN_SPAN_S = 0.05
@@ -96,6 +103,13 @@ def _mel_basis() -> np.ndarray:
         return librosa.filters.mel(
             sr=ANALYSIS_SR, n_fft=N_FFT, n_mels=N_MELS, fmin=FMIN, fmax=FMAX, norm=None
         ).astype(np.float32)
+
+
+@functools.lru_cache(maxsize=1)
+def _cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list("foley_ion", list(CMAP_STOPS), N=256)
 
 
 @functools.lru_cache(maxsize=1)
@@ -209,8 +223,8 @@ def _draw_panel(fig, clip: _Clip, box, span: float, label: str, scale: float,
     ax.axvspan(0, dur, color=_BG, lw=0)
     for lvl in (0.5, 0.1):
         for s in (1, -1):
-            ax.axhline(s * lvl, color=_GRID, lw=0.8, ls=(0, (4, 3)), alpha=0.8)
-    ax.axhline(0, color=_GRID, lw=0.5, alpha=0.4)
+            ax.axhline(s * lvl, color=_GRID, lw=0.8, ls=(0, (4, 3)), alpha=0.4)
+    ax.axhline(0, color=_GRID, lw=0.5, alpha=0.3)
     ax.fill_between(tc, lo, hi, color=_WAVE, lw=0.6)
     ax.plot(tc, rms, color=_RMS, lw=1.2 * scale)
     ax.plot(tc, -rms, color=_RMS, lw=1.2 * scale)
@@ -221,17 +235,17 @@ def _draw_panel(fig, clip: _Clip, box, span: float, label: str, scale: float,
     ax.xaxis.set_major_locator(AutoLocator())
     ax.tick_params(colors=_FG, labelsize=small, length=3)
     ax.tick_params(axis="x", labelbottom=False)
-    ax.grid(axis="x", color=_GRID, alpha=0.18, lw=0.6)
+    ax.grid(axis="x", color=_GRID, alpha=0.14, lw=0.6)
     ax.set_ylabel("amplitude", color=_FG, fontsize=small, labelpad=2)
     for sp in ax.spines.values():
-        sp.set_color(_GRID)
+        sp.set_color(_GRID_SOFT)
     ax.text(0.995, 0.93, "RMS", color=_RMS, fontsize=small, transform=ax.transAxes,
             ha="right", va="top", fontweight="bold")
 
     # spectrogram ------------------------------------------------------
     ax2 = fig.add_axes(rect(px, y0 + head + wave_h + gap, pw, spec_h), facecolor=_PAST_END)
     mel = _mel_db(clip.y, ncols)
-    im = ax2.imshow(mel, origin="lower", aspect="auto", cmap=CMAP, vmin=DB_MIN, vmax=DB_MAX,
+    im = ax2.imshow(mel, origin="lower", aspect="auto", cmap=_cmap(), vmin=DB_MIN, vmax=DB_MAX,
                     extent=(0, dur, -0.5, N_MELS - 0.5), interpolation="nearest")
     ax2.set_xlim(0, span)
     ax2.set_ylim(-0.5, N_MELS - 0.5)
@@ -246,11 +260,13 @@ def _draw_panel(fig, clip: _Clip, box, span: float, label: str, scale: float,
     ax2.tick_params(colors=_FG, labelsize=small, length=3)
     ax2.set_ylabel("Hz (mel scale)", color=_FG, fontsize=small, labelpad=2)
     ax2.set_xlabel("time (s)", color=_FG, fontsize=small, labelpad=2)
-    ax2.grid(axis="x", color="white", alpha=0.18, lw=0.6)
+    ax2.grid(axis="x", color=_GRID, alpha=0.14, lw=0.6)
     for sp in ax2.spines.values():
-        sp.set_color(_GRID)
+        sp.set_color(_GRID_SOFT)
     if dur < span * 0.999:
         for a in (ax, ax2):
+            a.axvspan(dur, span, facecolor="none", edgecolor=_GRID, alpha=0.18, hatch="////",
+                      lw=0)
             a.axvline(dur, color=_FG, lw=1.0, alpha=0.9)
         ax2.text(dur, N_MELS * 0.97, " end", color=_FG, fontsize=small, va="top", ha="left")
 
@@ -260,7 +276,7 @@ def _draw_panel(fig, clip: _Clip, box, span: float, label: str, scale: float,
         cb = fig.colorbar(im, cax=cax)
         cb.set_ticks([-80, -60, -40, -20, 0])
         cb.ax.tick_params(colors=_FG, labelsize=small, length=2)
-        cb.outline.set_edgecolor(_GRID)
+        cb.outline.set_edgecolor(_GRID_SOFT)
         cax.set_title("dBFS", color=_FG, fontsize=small, pad=3, loc="left")
 
 
@@ -344,7 +360,7 @@ def render_comparison(cfg: Config, conn: sqlite3.Connection, asset_ids: list[int
     fig = _new_figure(fig_w, fig_h)
     fig.text(8 / fig_w, 1 - 7 / fig_h,
              f"Comparison, shared time axis 0 to {span:.2f} s  |  spectrogram dBFS: "
-             "black = -80 (silence), white = 0  |  grey = past end of clip",
+             "navy = -80 (silence), cyan to white = 0 (loud)  |  hatched = past end of clip",
              color=_FG, fontsize=9, va="top", ha="left")
     for k, clip in enumerate(clips):
         r, c = divmod(k, cols)

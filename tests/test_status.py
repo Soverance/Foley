@@ -76,7 +76,9 @@ def test_status_after_index(indexed, library):
         {"rel_path": "sfx/click.wav", "project": "endless"},
         {"rel_path": "sfx/gone_long_ago.wav", "project": "endless"},
     ]
-    assert st["models"] == {"clap": "laion/clap-htsat-unfused"}
+    # provenance from meta: entries written by others are kept next to the indexer's
+    assert st["models"]["provenance"]["clap"] == "laion/clap-htsat-unfused"
+    assert set(st["models"]) == {"tags", "embeddings", "provenance"}
     assert st["errors"] == [{"rel_path": "sfx/broken.wav", "error": st["errors"][0]["error"]}]
     assert st["error_count"] == 1
     assert status.staleness_note(conn) is None

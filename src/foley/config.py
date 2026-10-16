@@ -3,6 +3,9 @@
 Every studio-specific value (library root, quarantine, pack priorities) comes from
 config, never from code, so the repo stays publishable.
 
+clap_checkpoints(cfg) -> list[str]: the [models] clap names the indexer computes
+(cfg.models_clap, or every foley.models.clap.CLAP_CHECKPOINTS entry when it is empty).
+
 Helpers shared with callers: parse_hhmm(value) -> "HH:MM" (ValueError if not a 24-hour
 time) and normalize_host(name) -> the lowercase host without port, brackets or trailing dot.
 """
@@ -42,14 +45,21 @@ class Config:
     dedupe_retention_days: float = 30.0
     dedupe_keep_priority: list[str] = field(default_factory=list)
     testset: Path | None = None
+    search_clap_model: str | None = None  # [search] clap_model (else meta, [models], default)
+    search_blend_weight: float | None = None  # [search] blend_weight 0..1 (else meta, 0.5)
     browse_loudness_target_lufs: float = -20.0  # [browse] loudness_target_lufs
     browse_host: str = "127.0.0.1"  # [browse] host
     browse_port: int = 8765  # [browse] port
     browse_allowed_hosts: list[str] = field(default_factory=list)  # [browse] allowed_hosts
+    browse_brand_dir: Path | None = None  # [browse] brand_dir: logo.png / wordmark.png
     schedule_enabled: bool = False  # [schedule] enabled
     schedule_time: str = "03:00"  # [schedule] time: "HH:MM", local time on the server
     schedule_catch_up: bool = True  # [schedule] catch_up
     schedule_startup_delay_minutes: float = 5.0  # [schedule] startup_delay_minutes
+    models_enabled: bool = True  # [models] enabled: tags + embeddings in a plain `foley index`
+    models_device: str = "auto"  # [models] device: auto | cuda | cpu
+    # [models] clap: CLAP checkpoints the indexer computes; empty = all of them
+    models_clap: list[str] = field(default_factory=list)
     source: Path | None = None  # the file this config was loaded from
 
     @property
@@ -134,6 +144,17 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     cfg.dedupe_retention_days = float(dedupe.get("retention_days", cfg.dedupe_retention_days))
     cfg.dedupe_keep_priority = list(dedupe.get("keep_priority", []))
     cfg.testset = _path(evaluation.get("testset"))
+    search = data.get("search", {})
+    clap = search.get("clap_model")
+    if clap is not None and (not isinstance(clap, str) or not clap.strip()):
+        raise ConfigError(f"search.clap_model must be a checkpoint name, got {clap!r}")
+    cfg.search_clap_model = clap.strip() if clap else None
+    weight = search.get("blend_weight")
+    if weight is not None:
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) \
+                or not 0 <= weight <= 1:
+            raise ConfigError(f"search.blend_weight must be between 0 and 1, got {weight!r}")
+        cfg.search_blend_weight = float(weight)
     cfg.browse_loudness_target_lufs = float(
         browse.get("loudness_target_lufs", cfg.browse_loudness_target_lufs)
     )
@@ -146,6 +167,10 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
         raise ConfigError("browse.allowed_hosts must be a list of host names")
     cfg.browse_allowed_hosts = [n for n in (normalize_host(h) for h in hosts) if n]
+    brand = browse.get("brand_dir")
+    if brand is not None and not isinstance(brand, str):
+        raise ConfigError(f"browse.brand_dir must be a folder path, got {brand!r}")
+    cfg.browse_brand_dir = _path(brand.strip() if brand else None)
     cfg.schedule_enabled = _bool(schedule.get("enabled", cfg.schedule_enabled),
                                  "schedule.enabled")
     try:
@@ -158,9 +183,37 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
         raise ConfigError(f"schedule.startup_delay_minutes must be >= 0, got {delay!r}")
     cfg.schedule_startup_delay_minutes = float(delay)
+    _models(cfg, data.get("models", {}))
     cfg.source = source
     check_data_dir(cfg)
     return cfg
+
+
+def clap_checkpoints(cfg) -> list[str]:
+    from foley.models.clap import CLAP_CHECKPOINTS
+
+    return list(getattr(cfg, "models_clap", None) or CLAP_CHECKPOINTS)
+
+
+def _models(cfg: Config, models: dict) -> None:
+    from foley.models.clap import CLAP_CHECKPOINTS
+
+    cfg.models_enabled = _bool(models.get("enabled", cfg.models_enabled), "models.enabled")
+    device = models.get("device", cfg.models_device)
+    if not isinstance(device, str) or not device.strip():
+        raise ConfigError(f"models.device must be auto, cuda or cpu, got {device!r}")
+    cfg.models_device = device.strip().lower()
+    clap = models.get("clap", cfg.models_clap)
+    if isinstance(clap, str):
+        clap = [clap]
+    if not isinstance(clap, list) or not all(isinstance(c, str) for c in clap):
+        raise ConfigError("models.clap must be a list of CLAP checkpoint names")
+    unknown = [c for c in clap if c not in CLAP_CHECKPOINTS]
+    if unknown:
+        raise ConfigError(
+            f"models.clap: unknown checkpoint(s) {unknown}; known: {', '.join(CLAP_CHECKPOINTS)}"
+        )
+    cfg.models_clap = list(dict.fromkeys(clap))
 
 
 def _inside(child: Path, parent: Path) -> bool:

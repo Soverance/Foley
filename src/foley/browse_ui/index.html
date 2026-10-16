@@ -5,30 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Foley Browser</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath d=%27M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2%27 fill=%27none%27 stroke=%27%234fc1b0%27 stroke-width=%272.2%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath d=%27M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2%27 fill=%27none%27 stroke=%27%235fd4ff%27 stroke-width=%272.2%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E">
+<link rel="preload" href="/static/fonts/Michroma-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/Barlow-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/JetBrainsMono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/app.css">
 <script type="module" src="/static/app.js"></script>
 </head>
 <body>
-<div class="app" id="app">
+<div class="app hud" id="app">
 
   <header class="topbar">
     <div class="brand" aria-label="Foley">
-      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg>
-      <span class="brand-name">Foley</span>
-    </div>
-    <div class="topbar-status" id="status-line" aria-live="polite">Connecting…</div>
-    <button type="button" class="scan-ind hidden" id="scan-ind" aria-haspopup="dialog" title="Library scans: schedule, history and logs">
-      <span class="scan-ind-icon" aria-hidden="true">
-        <span class="spinner small hidden" id="scan-ind-spin"></span>
-        <svg viewBox="0 0 24 24" id="scan-ind-clock"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      <span class="mark brand-mark" data-brand-logo aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg></span>
+      <span class="brand-text">
+        <span class="brand-name">Foley</span>
+        <img class="brand-wordmark hidden" id="brand-wordmark" alt="" draggable="false">
       </span>
+    </div>
+    <span class="topbar-div" aria-hidden="true"></span>
+    <div class="topbar-status" id="status-line" aria-live="polite"><span class="tcell"><span class="tl">Link</span><span class="tv">Connecting…</span></span></div>
+    <button type="button" class="scan-ind hidden" id="scan-ind" aria-haspopup="dialog" title="Library scans: schedule, history and logs">
+      <span class="lamp" id="scan-ind-lamp" aria-hidden="true"></span>
+      <span class="scan-ind-label">Scans</span>
       <span class="scan-ind-text" id="scan-ind-text">Scans</span>
     </button>
     <div class="topbar-actions">
-      <button type="button" class="btn ghost icon" id="help-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.1 9a3 3 0 1 1 4.2 2.8c-.8.4-1.3 1.1-1.3 2v.7"/><circle cx="12" cy="17.6" r=".6"/><circle cx="12" cy="12" r="10"/></svg>
+      <button type="button" class="round-btn" id="settings-btn" aria-haspopup="dialog" aria-label="Display settings" title="Display settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
       </button>
+      <button type="button" class="round-btn help-btn" id="help-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
     </div>
   </header>
 
@@ -38,19 +44,24 @@
 
     <!-- Left: library tree -->
     <nav class="pane pane-tree" aria-label="Library folders">
-      <div class="pane-head"><span class="pane-title">Library</span></div>
+      <div class="pane-head"><span class="pane-code" aria-hidden="true">L·01</span><span class="pane-title">Library</span><span class="ruler" aria-hidden="true"></span></div>
       <div class="tree-scroll" id="tree-scroll">
-        <button type="button" class="tree-special" id="shortlist-btn" data-view="shortlist">
+        <button type="button" class="tree-special shortlist" id="shortlist-btn" data-view="shortlist">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
           <span class="tree-label">Shortlist</span>
           <span class="tree-count" id="shortlist-count">0</span>
         </button>
-        <button type="button" class="tree-special" id="root-btn" data-view="root">
+        <button type="button" class="tree-special testset hidden" id="testset-btn" aria-haspopup="dialog" title="Test set: mark the files you would accept for each query (foley eval scores search against them)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4.5h6M9 4.5a1 1 0 0 0-1 1V7h8V5.5a1 1 0 0 0-1-1M8 6H6.5a1 1 0 0 0-1 1v12.5a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1H16"/><path d="m9 13.5 2 2 4-4"/></svg>
+          <span class="tree-label">Test set</span>
+          <span class="tree-count" id="testset-count"></span>
+        </button>
+        <button type="button" class="tree-special root" id="root-btn" data-view="root">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
           <span class="tree-label">All sounds</span>
           <span class="tree-count" id="root-count"></span>
         </button>
-        <div class="tree-sep" role="presentation"></div>
+        <div class="tree-sep" role="presentation"><span>Folders</span></div>
         <ul class="tree" id="tree" aria-label="Folders"></ul>
       </div>
     </nav>
@@ -60,7 +71,24 @@
     <!-- Middle: results -->
     <section class="pane pane-results" aria-label="Results">
       <div class="results-head">
-        <nav class="crumbs" id="crumbs" aria-label="Current folder"></nav>
+        <div class="results-bar">
+          <span class="pane-code" aria-hidden="true">R·02</span>
+          <nav class="crumbs" id="crumbs" aria-label="Current folder"></nav>
+          <span class="ruler center" aria-hidden="true"></span>
+        </div>
+        <div class="test-banner hidden" id="test-banner" role="region" aria-label="Active test query">
+          <span class="tb-code" aria-hidden="true">T·06</span>
+          <span class="tb-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span>
+          <div class="tb-main">
+            <div class="tb-line"><span class="tb-label">Marking answers for</span> <b class="tb-text" id="tb-text"></b> <span class="tb-count" id="tb-count"></span> <span class="tb-cue" id="tb-cue"></span></div>
+            <div class="tb-hint">The search box is not tied to this query: browse folders and similar sounds too, so the answers do not only come from keyword search. <kbd>T</kbd> marks the selected sound.</div>
+          </div>
+          <div class="tb-actions">
+            <button type="button" class="btn small" id="tb-search" title="Put the query text (and its filters) in the search box">Search query</button>
+            <button type="button" class="btn small ghost" id="tb-list" title="All test queries">Queries</button>
+            <button type="button" class="btn small ghost" id="tb-done" title="Stop marking answers">Done</button>
+          </div>
+        </div>
         <div class="search-row">
           <label class="search" for="q">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
@@ -119,11 +147,12 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
             Starred
           </button>
-          <button type="button" class="btn ghost small hidden" id="f-reset">Clear filters</button>
+          <button type="button" class="linkbtn hidden" id="f-reset">Clear filters</button>
         </div>
       </div>
 
       <div class="list-head" role="presentation">
+        <span class="col-idx">#</span>
         <span class="col-star"></span>
         <button type="button" class="col-name sorter" data-sort="name">Name</button>
         <button type="button" class="col-dur sorter" data-sort="duration">Dur</button>
@@ -144,118 +173,200 @@
 
     <!-- Right: detail -->
     <section class="pane pane-detail" aria-label="Sound details" id="detail">
-      <div class="detail-empty" id="detail-empty">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg>
-        <p class="detail-empty-title">Pick a sound to audition</p>
-        <p class="muted">Use <kbd>↑</kbd> <kbd>↓</kbd> to move through results. <kbd>Space</kbd> plays, <kbd>?</kbd> shows every shortcut.</p>
-      </div>
-
-      <div class="detail-body hidden" id="detail-body">
-        <div class="d-header">
-          <div class="d-title-row">
-            <h1 class="d-name" id="d-name"></h1>
-            <button type="button" class="star-btn big" id="d-star" aria-pressed="false" aria-label="Star (S)" title="Star (S)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
-            </button>
+      <div class="pane-head"><span class="pane-code" aria-hidden="true">D·03</span><span class="pane-title">Analysis</span><span class="ruler" aria-hidden="true"></span><span class="d-ast" id="d-ast"></span></div>
+      <div class="detail-scroll" id="detail-scroll">
+        <div class="detail-empty" id="detail-empty">
+          <div class="emblem big" aria-hidden="true">
+            <svg viewBox="0 0 120 120" class="emblem-rings"><circle cx="60" cy="60" r="58" class="r-dots"/><circle cx="60" cy="60" r="48" class="r-cyan"/><circle cx="60" cy="60" r="48" class="r-warm"/></svg>
+            <span class="mark emblem-mark" data-brand-logo><svg viewBox="0 0 24 24"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg></span>
           </div>
-          <nav class="d-crumbs" id="d-crumbs" aria-label="Folder of this sound"></nav>
-          <div class="d-path-row">
-            <code class="d-path" id="d-path"></code>
-            <button type="button" class="btn ghost small" id="d-copy" title="Copy full path">Copy path</button>
-          </div>
-          <div class="d-alert hidden" id="d-alert" role="status"></div>
+          <p class="detail-empty-title">Pick a sound to audition</p>
+          <p class="detail-empty-hint">Use <kbd>↑</kbd> <kbd>↓</kbd> to move through results. <kbd>Space</kbd> plays, <kbd>?</kbd> shows every shortcut.</p>
         </div>
 
-        <div class="wave-wrap" id="wave-wrap">
-          <canvas id="wave" class="wave" aria-label="Waveform. Click or drag to seek." role="img"></canvas>
-          <div class="wave-hover hidden" id="wave-hover"></div>
-          <div class="wave-msg" id="wave-msg"></div>
-          <button type="button" class="wave-fit" id="wave-fit" aria-pressed="false" title="Scale waveform to its peak">Fit</button>
-        </div>
-
-        <div class="overview" id="overview">
-          <img id="ov-img" alt="Foley overview: waveform with RMS envelope above a log-mel spectrogram" draggable="false">
-          <div class="ov-playhead hidden" id="ov-playhead"></div>
-          <div class="ov-msg" id="ov-msg"></div>
-        </div>
-
-        <section class="d-section">
-          <p class="d-caption" id="d-caption"></p>
-          <div class="tags" id="d-tags"></div>
-        </section>
-
-        <section class="d-section">
-          <h2 class="d-h">Shortlist note</h2>
-          <div class="note-row">
-            <textarea id="d-note" rows="2" placeholder="Why this one? (saving a note stars the sound)" aria-label="Shortlist note"></textarea>
+        <div class="detail-body hidden" id="detail-body">
+          <div class="d-header">
+            <div class="d-status" id="d-status"><span class="lamp" aria-hidden="true"></span><span class="d-status-label" id="d-status-label">Active</span><span class="d-status-meta" id="d-status-meta"></span></div>
+            <div class="d-title-row">
+              <h1 class="d-name" id="d-name"></h1>
+              <button type="button" class="good-btn hidden" id="d-good" aria-pressed="false" title="Good answer for the active test query (T)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>Good answer</span></button>
+              <button type="button" class="round-btn sim-btn" id="d-find-sim" title="Find similar sounds (F)" aria-label="Find similar sounds (F)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0-11 0"/><path d="M10 12a5.5 5.5 0 1 0 11 0a5.5 5.5 0 1 0-11 0"/></svg></button>
+              <button type="button" class="star-btn big" id="d-star" aria-pressed="false" aria-label="Star (S)" title="Star (S)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
+              </button>
+            </div>
+            <nav class="d-crumbs" id="d-crumbs" aria-label="Folder of this sound"></nav>
+            <div class="d-path-row">
+              <code class="d-path" id="d-path"></code>
+              <button type="button" class="btn small" id="d-copy" title="Copy full path">Copy</button>
+            </div>
+            <div class="d-alert hidden" id="d-alert" role="status"></div>
           </div>
-          <div class="note-status muted" id="d-note-status" aria-live="polite"></div>
-        </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Analysis</h2>
-          <dl class="nums" id="d-nums"></dl>
-        </section>
+          <section class="d-block">
+            <h2 class="d-h">Spectral overview <span class="d-h-sub">log-mel · −80…0 dBFS</span></h2>
+            <div class="overview" id="overview">
+              <img id="ov-img" alt="Foley overview: waveform with RMS envelope above a log-mel spectrogram" draggable="false">
+              <div class="ov-playhead hidden" id="ov-playhead"></div>
+              <div class="ov-msg" id="ov-msg"></div>
+            </div>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Band energy <span class="d-h-sub">share of total energy</span></h2>
-          <div class="bands" id="d-bands"></div>
-        </section>
+          <section class="loud" id="d-loud" aria-label="Loudness">
+            <div class="gauge" id="lg" role="img" aria-label="Integrated loudness">
+              <svg viewBox="0 0 118 118" aria-hidden="true">
+                <circle cx="59" cy="59" r="56" class="g-dots"/>
+                <circle cx="59" cy="59" r="46" class="g-track"/>
+                <circle cx="59" cy="59" r="46" class="g-val" id="lg-arc"/>
+                <circle cx="59" cy="59" r="4" class="g-target" id="lg-target"/>
+              </svg>
+              <div class="gauge-read"><span class="gauge-num" id="lg-num">—</span><span class="gauge-unit">LUFS int</span></div>
+            </div>
+            <dl class="loud-reads">
+              <div><dt>Short-term max</dt><dd id="lr-st">—</dd></div>
+              <div><dt>True peak</dt><dd id="lr-tp">—</dd></div>
+              <div><dt>To target</dt><dd id="lr-gain" class="warm">—</dd></div>
+            </dl>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Licence</h2>
-          <div id="d-license"></div>
-        </section>
+          <section class="d-block">
+            <p class="d-caption" id="d-caption"></p>
+            <div class="tags" id="d-tags"></div>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Duplicates <span class="d-h-sub" id="d-dupes-count"></span></h2>
-          <ul class="dupes" id="d-dupes"></ul>
-        </section>
+          <section class="d-block" id="d-similar-sec">
+            <h2 class="d-h d-h-row">Similar sounds <span class="d-h-sub" id="d-similar-sub"></span>
+              <button type="button" class="btn small d-h-btn hidden" id="d-similar-all" title="List every similar sound in the results (F)">Find similar <kbd>F</kbd></button>
+            </h2>
+            <ul class="similar" id="d-similar" aria-label="Similar sounds"></ul>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Ledger</h2>
-          <div id="d-ledger"></div>
-        </section>
+          <section class="d-block">
+            <h2 class="d-h d-h-row">Shortlist note <span class="note-status" id="d-note-status" aria-live="polite"></span></h2>
+            <div class="note-row">
+              <textarea id="d-note" rows="2" placeholder="Why this one? (saving a note stars the sound)" aria-label="Shortlist note"></textarea>
+            </div>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Embedded metadata</h2>
-          <div id="d-meta"></div>
-        </section>
+          <section class="d-block">
+            <h2 class="d-h">Readouts</h2>
+            <dl class="nums" id="d-nums"></dl>
+          </section>
 
-        <section class="d-section">
-          <h2 class="d-h">Catalog record</h2>
-          <dl class="kv" id="d-record"></dl>
-        </section>
+          <section class="d-block">
+            <h2 class="d-h">Band energy <span class="d-h-sub">share of total energy</span></h2>
+            <div class="bands" id="d-bands"></div>
+          </section>
+
+          <div class="accs" id="d-accs">
+            <section class="acc" data-acc="license">
+              <h2 class="acc-h"><button type="button" class="acc-btn" aria-expanded="false" aria-controls="acc-license"><span class="acc-code">01</span><span class="acc-title">Licence</span><span class="acc-sum" id="d-license-sum"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></h2>
+              <div class="acc-body" id="acc-license" hidden><div id="d-license"></div></div>
+            </section>
+            <section class="acc" data-acc="dupes">
+              <h2 class="acc-h"><button type="button" class="acc-btn" aria-expanded="false" aria-controls="acc-dupes"><span class="acc-code">02</span><span class="acc-title">Duplicates</span><span class="acc-sum" id="d-dupes-count"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></h2>
+              <div class="acc-body" id="acc-dupes" hidden><ul class="dupes" id="d-dupes"></ul></div>
+            </section>
+            <section class="acc" data-acc="ledger">
+              <h2 class="acc-h"><button type="button" class="acc-btn" aria-expanded="false" aria-controls="acc-ledger"><span class="acc-code">03</span><span class="acc-title">Ledger</span><span class="acc-sum" id="d-ledger-sum"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></h2>
+              <div class="acc-body" id="acc-ledger" hidden><div id="d-ledger"></div></div>
+            </section>
+            <section class="acc" data-acc="meta">
+              <h2 class="acc-h"><button type="button" class="acc-btn" aria-expanded="false" aria-controls="acc-meta"><span class="acc-code">04</span><span class="acc-title">Embedded metadata</span><span class="acc-sum" id="d-meta-sum"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></h2>
+              <div class="acc-body" id="acc-meta" hidden><div id="d-meta"></div></div>
+            </section>
+            <section class="acc" data-acc="record">
+              <h2 class="acc-h"><button type="button" class="acc-btn" aria-expanded="false" aria-controls="acc-record"><span class="acc-code">05</span><span class="acc-title">Catalog record</span><span class="acc-sum" id="d-record-sum"></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button></h2>
+              <div class="acc-body" id="acc-record" hidden><dl class="kv" id="d-record"></dl></div>
+            </section>
+          </div>
+        </div>
       </div>
     </section>
   </main>
 
-  <!-- Transport -->
+  <!-- Audition deck -->
   <footer class="transport" aria-label="Transport">
-    <div class="t-buttons">
-      <button type="button" class="tbtn" id="t-restart" aria-label="Play from start (Enter)" title="Play from start (Enter)">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14"/><path d="M19 5 9 12l10 7z" class="fill"/></svg>
-      </button>
-      <button type="button" class="tbtn primary" id="t-play" aria-label="Play (Space)" title="Play / pause (Space)">
-        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-play"><path d="M7 4.5v15l12.5-7.5z" class="fill"/></svg>
-        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-pause"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" class="fill"/></svg>
-      </button>
-      <button type="button" class="tbtn" id="t-stop" aria-label="Stop (Esc)" title="Stop (Esc)">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" class="fill"/></svg>
-      </button>
+    <div class="t-ring-col">
+      <div class="t-ring">
+        <svg viewBox="0 0 168 168" aria-hidden="true">
+          <g class="ring-deco" id="t-ring-deco">
+            <circle cx="84" cy="84" r="81" class="rd-dash"/>
+            <circle cx="84" cy="84" r="81" class="rd-warm"/>
+            <circle cx="84" cy="84" r="81" class="rd-cyan"/>
+          </g>
+          <circle cx="84" cy="84" r="73" class="rd-ticks"/>
+          <circle cx="84" cy="84" r="64" class="rd-track"/>
+          <circle cx="84" cy="84" r="64" class="rd-prog" id="t-prog"/>
+        </svg>
+        <button type="button" class="t-play" id="t-play" aria-label="Play (Space)" title="Play / pause (Space)">
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-play"><path d="M7 4.5v15l12.5-7.5z" class="fill"/></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-pause"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" class="fill"/></svg>
+        </button>
+      </div>
+      <div class="t-side">
+        <div class="t-time" aria-live="off">
+          <span class="micro">T+ Elapsed</span>
+          <span class="t-cur" id="t-cur">0:00.00</span>
+          <span class="t-durline"><span class="t-sep">/</span> <span id="t-dur">0:00.00</span></span>
+        </div>
+        <div class="t-buttons">
+          <button type="button" class="tbtn cut-tl" id="t-restart" aria-label="Play from start (Enter)" title="Play from start (Enter)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14"/><path d="M19 5 9 12l10 7z" class="fill"/></svg>
+          </button>
+          <button type="button" class="tbtn cut-br" id="t-stop" aria-label="Stop (Esc)" title="Stop (Esc)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" class="fill"/></svg>
+          </button>
+        </div>
+      </div>
     </div>
-    <div class="t-time" aria-live="off"><span id="t-cur">0:00.00</span><span class="t-sep">/</span><span id="t-dur">0:00.00</span></div>
-    <div class="t-now" id="t-now" title=""><span class="muted">Nothing loaded</span></div>
-    <div class="t-toggles">
-      <button type="button" class="toggle" id="t-loop" aria-pressed="false" title="Loop (L)">Loop <kbd>L</kbd></button>
-      <button type="button" class="toggle" id="t-autoplay" aria-pressed="true" title="Play each sound as you select it">Autoplay</button>
-      <button type="button" class="toggle" id="t-match" aria-pressed="true" title="Match loudness to the catalog target">Match loudness</button>
-      <span class="t-gain" id="t-gain" title="Gain applied by loudness match">0.0 dB</span>
+
+    <div class="t-wave-col">
+      <div class="t-wave-head">
+        <span class="pane-code" aria-hidden="true">W·04</span>
+        <span class="micro t-now-label">Now auditioning</span>
+        <div class="t-now" id="t-now" title=""><span class="muted">Nothing loaded</span></div>
+        <button type="button" class="wave-fit" id="wave-fit" aria-pressed="false" title="Scale waveform to its peak">Fit</button>
+      </div>
+      <div class="t-ruler" id="t-ruler" aria-hidden="true"></div>
+      <div class="wave-wrap empty" id="wave-wrap">
+        <canvas id="wave" class="wave" aria-label="Waveform. Click or drag to seek." role="img"></canvas>
+        <div class="wave-hover hidden" id="wave-hover"></div>
+        <div class="wave-msg" id="wave-msg"></div>
+        <div class="wave-empty" aria-hidden="true">Nothing loaded</div>
+      </div>
     </div>
-    <div class="t-vol">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" class="fill"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19 6a8.5 8.5 0 0 1 0 12"/></svg>
-      <input type="range" id="t-volume" min="0" max="100" step="1" value="80" aria-label="Master volume">
-      <span class="t-vol-val" id="t-volume-val">80</span>
+
+    <div class="t-out-col">
+      <div class="t-toggles">
+        <button type="button" class="toggle" id="t-loop" aria-pressed="false" title="Loop (L)"><span class="lamp" aria-hidden="true"></span><span class="tg-label">Loop</span><kbd>L</kbd></button>
+        <button type="button" class="toggle" id="t-autoplay" aria-pressed="true" title="Play each sound as you select it"><span class="lamp" aria-hidden="true"></span><span class="tg-label">Autoplay</span></button>
+        <button type="button" class="toggle" id="t-match" aria-pressed="true" title="Match loudness to the catalog target"><span class="lamp" aria-hidden="true"></span><span class="tg-label">Match loudness</span></button>
+      </div>
+      <div class="t-meters">
+        <div class="t-gain-row">
+          <div class="t-gain" id="t-gain" title="Gain applied by loudness match">
+            <svg viewBox="0 0 84 84" aria-hidden="true">
+              <circle cx="42" cy="42" r="34" class="gg-track"/>
+              <circle cx="42" cy="42" r="34" class="gg-val" id="t-gain-arc"/>
+              <circle cx="66.04" cy="17.96" r="2.5" class="gg-zero"/>
+            </svg>
+            <div class="gauge-read"><span class="t-gain-val" id="t-gain-val">—</span><span class="gauge-unit">Gain dB</span></div>
+          </div>
+          <div class="t-gain-info">
+            <span class="micro">Loudness match</span>
+            <span class="t-gain-note" id="t-gain-note">nothing loaded</span>
+            <span class="t-gain-clamp">clamp −24…+12 dB</span>
+          </div>
+        </div>
+        <div class="t-vol">
+          <div class="t-vol-head"><label class="micro" for="t-volume">Master</label><span class="t-vol-val" id="t-volume-val">80</span></div>
+          <div class="t-vol-bar">
+            <div class="vol-segs" id="t-vol-segs" aria-hidden="true"></div>
+            <input type="range" id="t-volume" class="vol-range" min="0" max="100" step="1" value="80" aria-label="Master volume">
+          </div>
+        </div>
+      </div>
     </div>
   </footer>
 
@@ -263,8 +374,9 @@
 
   <dialog class="help" id="help" aria-labelledby="help-title">
     <div class="help-head">
+      <span class="pane-code" aria-hidden="true">H·00</span>
       <h2 id="help-title">Keyboard shortcuts</h2>
-      <button type="button" class="btn ghost icon" id="help-close" aria-label="Close">
+      <button type="button" class="dlg-close" id="help-close" aria-label="Close">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>
     </div>
@@ -286,6 +398,8 @@
           <dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>Jump a page</dd>
           <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>First / last sound</dd>
           <dt><kbd>S</kbd></dt><dd>Star / unstar</dd>
+          <dt><kbd>F</kbd></dt><dd>Find similar sounds</dd>
+          <dt><kbd>T</kbd></dt><dd>Mark / unmark a good answer for the active test query</dd>
           <dt><kbd>/</kbd></dt><dd>Focus search (<kbd>↓</kbd> back to results)</dd>
           <dt><kbd>?</kbd></dt><dd>This help</dd>
         </dl>
@@ -298,34 +412,67 @@
     </div>
   </dialog>
 
+  <dialog class="help settings" id="settings" aria-labelledby="settings-title">
+    <div class="help-head">
+      <span class="pane-code" aria-hidden="true">C·07</span>
+      <h2 id="settings-title">Display</h2>
+      <button type="button" class="dlg-close" id="settings-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="settings-body">
+      <div class="set-row">
+        <div class="set-text"><span class="set-title">Console decoration</span><span class="set-sub">Corner brackets, tick rulers and the dot grid.</span></div>
+        <button type="button" class="toggle plain" id="set-hud" aria-pressed="true"><span class="lamp" aria-hidden="true"></span><span class="tg-label">HUD</span></button>
+      </div>
+      <div class="set-row">
+        <div class="set-text"><span class="set-title">Row density</span><span class="set-sub">Compact rows hide the tags and caption line.</span></div>
+        <div class="seg" role="radiogroup" aria-label="Row density" id="set-density">
+          <button type="button" role="radio" aria-checked="true" data-v="comfortable">Comfortable</button>
+          <button type="button" role="radio" aria-checked="false" data-v="compact">Compact</button>
+        </div>
+      </div>
+      <p class="sc-note">Remembered in this browser. Animations stop when the system asks for reduced motion.</p>
+    </div>
+  </dialog>
+
   <dialog class="help scans" id="scans" aria-labelledby="scans-title">
     <div class="help-head">
+      <span class="pane-code" aria-hidden="true">S·05</span>
       <h2 id="scans-title">Library scans</h2>
-      <button type="button" class="btn ghost icon" id="scans-close" aria-label="Close">
+      <button type="button" class="dlg-close" id="scans-close" aria-label="Close">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>
     </div>
     <div class="scans-body">
-      <section class="sc-section">
-        <h3>Daily scan <span class="sc-clock" id="sc-clock"></span></h3>
-        <form class="sc-form" id="sc-form" autocomplete="off">
-          <button type="button" class="toggle" id="sc-enabled" aria-pressed="false" title="Run `foley index` once a day while this server is running">Scan daily</button>
-          <label class="sc-time">at
-            <input type="time" id="sc-time" step="60" required aria-describedby="sc-clock">
-            <span class="muted" id="sc-tz-short"></span>
-          </label>
-          <button type="button" class="toggle" id="sc-catchup" aria-pressed="true" title="If the server was off at the scheduled time, scan a few minutes after it starts">Catch up after downtime</button>
-          <button type="submit" class="btn" id="sc-save" disabled>Save</button>
-        </form>
-        <p class="sc-note muted" id="sc-next"></p>
+      <section class="sc-section sc-daily">
+        <div class="sc-daily-main">
+          <h3>Daily scan <span class="sc-clock" id="sc-clock"></span></h3>
+          <form class="sc-form" id="sc-form" autocomplete="off">
+            <button type="button" class="toggle plain" id="sc-enabled" aria-pressed="false" title="Run `foley index` once a day while this server is running"><span class="lamp" aria-hidden="true"></span><span class="tg-label">Scan daily</span></button>
+            <label class="sc-time">at
+              <input type="time" id="sc-time" step="60" required aria-describedby="sc-clock">
+              <span class="muted" id="sc-tz-short"></span>
+            </label>
+            <button type="button" class="toggle plain" id="sc-catchup" aria-pressed="true" title="If the server was off at the scheduled time, scan a few minutes after it starts"><span class="lamp" aria-hidden="true"></span><span class="tg-label">Catch up after downtime</span></button>
+            <button type="submit" class="btn mono-btn" id="sc-save" disabled>Save</button>
+          </form>
+          <p class="sc-note muted" id="sc-next"></p>
+        </div>
+        <div class="sc-last" id="sc-last">
+          <span class="micro">Last run</span>
+          <span class="sc-last-when" id="sc-last-when">—</span>
+          <span class="sc-last-outcome" id="sc-last-outcome"></span>
+        </div>
       </section>
 
       <section class="sc-section">
         <div class="sc-run-row">
           <button type="button" class="btn sc-primary" id="sc-run">Scan now</button>
-          <button type="button" class="btn" id="sc-stop" disabled>Stop</button>
+          <button type="button" class="btn sc-stop" id="sc-stop" disabled>Stop</button>
           <span class="sc-run-state" id="sc-run-state" aria-live="polite"></span>
         </div>
+        <div class="sc-progress hidden" id="sc-progress" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100"><span id="sc-progress-bar"></span></div>
         <p class="sc-note muted">A scan is an incremental <code>foley index</code>: it reads the library, never changes it, and commits after every file. Stopping is safe; the next scan resumes where this one stopped.</p>
         <div class="sc-log-head">
           <span class="sc-log-title" id="sc-log-title">Log</span>
@@ -347,6 +494,26 @@
           </table>
         </div>
       </section>
+    </div>
+  </dialog>
+
+  <dialog class="help testset" id="testset" aria-labelledby="ts-title">
+    <div class="help-head">
+      <span class="pane-code" aria-hidden="true">T·06</span>
+      <h2 id="ts-title">Test set <span class="ts-path" id="ts-path"></span></h2>
+      <button type="button" class="dlg-close" id="ts-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="ts-body">
+      <p class="sc-note muted">Pick a query, then audition freely and press <kbd>T</kbd> on the 1–3 files you would accept for it. Browse folders and similar sounds as well as searching, so the test set does not favour keyword search. <code>foley eval</code> scores search against these answers.</p>
+      <ol class="ts-list" id="ts-list"></ol>
+      <form class="ts-add" id="ts-add" autocomplete="off">
+        <input type="text" id="ts-new-text" placeholder="New query, e.g. short metallic UI click" aria-label="New query text" required>
+        <input type="text" id="ts-new-cue" placeholder="Cue (optional)" aria-label="Cue">
+        <label class="ts-maxdur">≤ <input type="number" class="num" id="ts-new-maxdur" min="0" step="0.1" placeholder="any" aria-label="Maximum duration filter, seconds"> s</label>
+        <button type="submit" class="btn mono-btn">Add query</button>
+      </form>
     </div>
   </dialog>
 

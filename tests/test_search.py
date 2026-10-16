@@ -137,6 +137,7 @@ def test_compact_result_shape(conn):
         "id",
         "path",
         "score",
+        "similarity",
         "caption",
         "tags",
         "duration_s",
@@ -249,7 +250,8 @@ def test_rejected_hidden_for_project_only(conn):
 def test_note_from_status(conn, monkeypatch):
     build(conn)
     monkeypatch.setattr(status, "staleness_note", lambda c: "catalog last scanned 3 days ago")
-    assert search.search(conn, "scratch")["note"] == "catalog last scanned 3 days ago"
+    note = search.search(conn, "scratch")["note"]
+    assert note.startswith("catalog last scanned 3 days ago; keyword-only search")
 
 
 def test_limit(conn):
