@@ -163,14 +163,25 @@ def cmd_dedupe(cfg, args) -> int:
 
 
 def cmd_browse(cfg, args) -> int:
+    import logging
+
     from foley import browse
 
+    host = args.host if args.host is not None else cfg.browse_host
+    port = args.port if args.port is not None else cfg.browse_port
     try:
-        browse.serve(cfg, host=args.host, port=args.port, open_browser=not args.no_open,
+        browse.serve(cfg, host=host, port=port, open_browser=not args.no_open,
                      verbose=args.verbose)
     except OSError as e:  # port in use, address not available, ...
-        print(f"foley: cannot serve on {args.host}:{args.port}: {e}", file=sys.stderr)
+        # Logged, not printed: under pythonw.exe there is no stderr (configure_logging
+        # sends it to the console when there is one, and to --log-file).
+        logging.getLogger("foley.browse").error(
+            "foley: cannot serve on %s:%s: %s (is another foley browse or web server "
+            "using the port?)", host, port, e)
         return 2
+    except Exception:
+        logging.getLogger("foley.browse").exception("foley browse crashed")
+        raise
     return 0
 
 
@@ -232,21 +243,35 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_dedupe)
 
     s = sub.add_parser("browse", help="local web UI to browse, search and audition the library")
-    s.add_argument("--host", default="127.0.0.1",
-                   help="address to listen on (default 127.0.0.1; keep it on loopback)")
-    s.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    s.add_argument("--host", default=None,
+                   help="address to listen on (default: [browse] host, else 127.0.0.1)")
+    s.add_argument("--port", type=int, default=None,
+                   help="port (default: [browse] port, else 8765)")
     s.add_argument("--no-open", action="store_true", help="do not open a browser")
     s.add_argument("--verbose", action="store_true", help="log every request")
+    s.add_argument("--log-file", metavar="PATH",
+                   help="also log server and scan events to this size-rotated file")
     s.set_defaults(func=cmd_browse)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "browse":
+        # Before the config loads, so a bad config is in the log file too (under
+        # pythonw.exe, e.g. a logon task, there is no console to print it to).
+        from foley import browse
+
+        browse.configure_logging(args.log_file)
     try:
         cfg = config_mod.load(args.config)
     except config_mod.ConfigError as e:
-        print(f"foley: {e}", file=sys.stderr)
+        if args.command == "browse":
+            import logging
+
+            logging.getLogger("foley.browse").error("foley: %s", e)
+        else:
+            print(f"foley: {e}", file=sys.stderr)
         return 2
     if not Path(cfg.library_root).exists() and args.command == "index":
         print(f"foley: library root not reachable: {cfg.library_root}", file=sys.stderr)

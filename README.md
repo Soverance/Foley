@@ -38,7 +38,13 @@ foley browse                 # http://127.0.0.1:8765/, opens your browser
 foley browse --port 9000 --no-open
 ```
 
-It listens on 127.0.0.1 only and answers only requests addressed to localhost. Keep it that way: sample licences usually forbid serving a library to anyone else. Star files to put them on a shortlist (`shortlist.json` in the data folder, keyed by file content so stars survive moves); Claude Code reads it with the MCP tool `get_shortlist`. Set the loudness-match target with `[browse] loudness_target_lufs` in `foley.toml` (default -20). The browser never writes to the library. Everything it caches (peaks, images, the shortlist) lives in the data folder.
+By default it listens on 127.0.0.1 and answers only requests addressed to localhost. To use it from other machines in the studio, set `[browse] host`, `port` and `allowed_hosts` in `foley.toml` (requests for any other host name get 403); mind your sample licences, which usually forbid serving a library beyond its licensees. `--log-file PATH` logs server and scan events to a rotating file, for running it unattended (e.g. with `pythonw.exe -m foley.cli browse --no-open` from a logon task).
+
+On Windows, `scripts\windows\install-browse-task.ps1` registers exactly that logon task (no admin needed; `-Uninstall` removes it), and `scripts\windows\allow-browse-firewall.ps1 -Port <port>` (elevated) opens the port to Domain/Private networks on the local subnet.
+
+Left running, it also keeps the catalog current: the Scans dialog (click the scan status in the top bar) turns on a daily `foley index` at a time you pick, shows the live log and the history, and has Scan now / Stop. Defaults come from `[schedule]` in `foley.toml`; see `foley.toml.example`.
+
+Star files to put them on a shortlist (`shortlist.json` in the data folder, keyed by file content so stars survive moves); Claude Code reads it with the MCP tool `get_shortlist`. Set the loudness-match target with `[browse] loudness_target_lufs` in `foley.toml` (default -20). The browser never writes to the library. Everything it caches (peaks, images, the shortlist) lives in the data folder.
 
 ## Safety
 

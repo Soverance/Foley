@@ -114,9 +114,10 @@ The library is a living folder: Scott adds packs, removes files and reorganizes.
 **When it runs**
 
 - **On demand:** `foley index` after adding packs.
-- **Nightly:** a Windows Task Scheduler job on the master machine. `foley schedule install` registers it.
+- **Daily, from the browse server:** the master machine runs `foley browse` permanently (started at logon), and its built-in scheduler runs the scan. It is set in the browser's Scans dialog (on/off, a local time such as 03:00, catch-up) with defaults from `[schedule]` in `foley.toml`; the dialog's settings are saved to `schedule.json` in the data folder. Each scan is an ordinary `foley index` subprocess, so it behaves exactly like a manual run: incremental, resumable, read-only on the library. Its output goes to `logs/scan-*.log` in the data folder (the newest 30 are kept) and its outcome (`ok`, `failed`, `skipped`, `stopped`) to `logs/scans.json`. The dialog shows the live log, the history with each run's counts, and Scan now / Stop; stopping kills the whole process tree and is safe because the next run resumes. Only one scan runs at a time: if a CLI `foley index` holds the lock at the scheduled time, the scan is recorded as skipped and the next day's slot tries again.
+- **Catch-up:** if the server was off at the scheduled time (machine asleep or shut down), it scans a few minutes after starting (`startup_delay_minutes`, default 5, so the network and NAS are up after logon) whenever the last completed scan is older than the most recent scheduled time. Times are the server's local wall clock, so the slot stays at 03:00 across daylight-saving changes.
 - **Staleness is visible:** `catalog_status` and every `search_audio` response report when the library was last scanned and how many files are pending or missing, so Claude Code can say the catalog is stale instead of silently searching an old index.
-- No live file watching. Watching an SMB share drops events during bulk copies and does not survive disconnects, so the nightly scan would still be needed as the backstop.
+- No live file watching. Watching an SMB share drops events during bulk copies and does not survive disconnects, so the daily scan would still be needed as the backstop.
 
 ## Duplicate cleanup
 
@@ -312,7 +313,7 @@ Scope: pipeline stages 6–7 (PANNs tags, CLAP embeddings), hybrid search, `find
 
 ### Phase 2: the review loop and duplicate cleanup (launch window if Phase 1 is early, else after launch)
 
-Scope: `decisions` and `usages` writes, Sound Board review queue and catalog view, `get_examples`, `record_decision`, `check_mix_fit`, `foley.project.toml` with loudness targets and hero slots, the CLAUDE.md selection workflow, nightly scheduled sync, and `foley dedupe plan / apply / restore / purge`. Duplicate cleanup does not touch Endless Reach, so Scott may pull it forward once Phase 1a passes.
+Scope: `decisions` and `usages` writes, Sound Board review queue and catalog view, `get_examples`, `record_decision`, `check_mix_fit`, `foley.project.toml` with loudness targets and hero slots, the CLAUDE.md selection workflow, daily scheduled sync (delivered early by the `foley browse` scheduler; see Library sync), and `foley dedupe plan / apply / restore / purge`. Duplicate cleanup does not touch Endless Reach, so Scott may pull it forward once Phase 1a passes.
 
 - [ ] Every Sound Board action writes a correct `decisions` row
 - [ ] Claude Code follows the workflow end to end on 10 new slots without manual steering
@@ -356,7 +357,7 @@ The biggest technical risk is CLAP underperforming on stylized game SFX; hybrid 
 - [ ] Endless Reach audio lock date, which sets the real Phase 1 deadline
 - [ ] How many Endless Reach audio slots are still unfilled? If few, Foley's pre-launch value is mostly a loudness audit of the audio already in the game
 - [ ] Does the Sound Board live in the Endless Reach repo or its own?
-- [ ] Which machine holds the master catalog and `ledger.db`, and runs the nightly sync?
+- [ ] Which machine holds the master catalog and `ledger.db`, and runs the daily sync (`foley browse` left running)?
 - [ ] Quarantine folder location and retention period (proposed: `\\data.soverance.net\Files\Assets\Audio-Quarantine`, 30 days)
 - [ ] `dedupe.keep_priority`: when the same file is in two packs, which pack keeps it?
 - [x] Open-source license: MIT. Git history is published as-is

@@ -140,20 +140,34 @@ function toast(msg, kind) {
   setTimeout(() => t.remove(), kind === 'error' ? 4500 : 2200);
 }
 
+// Over plain http from another machine the page is not a secure context and
+// navigator.clipboard does not exist, so fall back to a hidden textarea + execCommand.
+function legacyCopy(text) {
+  const active = document.activeElement;
+  const ta = h('textarea', { readonly: true, 'aria-hidden': 'true', tabindex: '-1', style: 'position:fixed;top:0;left:-9999px;width:1px;height:1px;opacity:0' });
+  ta.value = text;
+  // Inside a modal dialog everything outside it is inert, so the textarea goes there.
+  (document.querySelector('dialog[open]') || document.body).append(ta);
+  ta.focus({ preventScroll: true });
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch { /* ignore */ }
+  ta.remove();
+  if (active && typeof active.focus === 'function') active.focus({ preventScroll: true });
+  return ok;
+}
+
 async function copyText(text, label = 'Copied') {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(label);
-  } catch {
-    const ta = h('textarea', { style: 'position:fixed;opacity:0' });
-    ta.value = text;
-    document.body.append(ta);
-    ta.select();
-    let ok = false;
-    try { ok = document.execCommand('copy'); } catch { /* ignore */ }
-    ta.remove();
-    toast(ok ? label : 'Copy failed', ok ? '' : 'error');
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(label);
+      return;
+    } catch { /* permission denied etc.: try the legacy path */ }
   }
+  const ok = legacyCopy(text);
+  toast(ok ? label : 'Copy failed: select the text and press Ctrl+C', ok ? '' : 'error');
 }
 
 // ------------------------------------------------------------------ global state
@@ -203,6 +217,7 @@ function renderStatus() {
   $('status-line').replaceChildren(...parts);
   $('root-count').textContent = fmtInt(a.active);
   setShortlistCount(s.shortlist_count);
+  if (s.scan) scanUI.setState(s.scan);
 }
 function setShortlistCount(n) {
   if (isNum(n)) $('shortlist-count').textContent = fmtInt(n);
@@ -313,6 +328,47 @@ const tree = {
     this.markCurrent();
     const cur = this.nodes.get(path);
     if (cur) cur.row.scrollIntoView({ block: 'nearest' });
+  },
+
+  // After a scan: refresh the counts of every loaded level in place, adding folders that
+  // appeared and dropping ones that vanished, without collapsing what is expanded.
+  async refreshCounts() {
+    const levels = [{ path: '', ul: this.root }];
+    for (const n of this.nodes.values()) if (n.loaded) levels.push({ path: n.path, ul: n.ul, node: n });
+    await Promise.all(levels.map(async ({ path, ul, node }) => {
+      let r;
+      try { r = await this.fetch(path); } catch { return; } // vanished: its parent drops it
+      if (node && !this.nodes.has(path)) return; // dropped while we waited
+      const folders = (r && r.folders) || [];
+      const want = new Set(folders.map((f) => f.path));
+      for (const [p, n] of [...this.nodes]) {
+        if (n.li.parentElement === ul && !want.has(p)) this.forget(p);
+      }
+      for (const li of [...ul.children]) if (li.classList.contains('tree-loading') || li.classList.contains('tree-error')) li.remove();
+      for (const f of folders) {
+        const existing = this.nodes.get(f.path);
+        if (existing) {
+          existing.row.querySelector('.tree-count').textContent = fmtInt(f.count);
+          ul.append(existing.li); // re-append in server order; keeps its subtree
+        } else {
+          ul.append(this.makeNode(f));
+        }
+      }
+      if (!folders.length && path === '') ul.append(h('li', { class: 'tree-loading', text: 'No folders' }));
+      if (node) {
+        const leaf = !folders.length;
+        node.toggle.classList.toggle('leaf', leaf);
+        if (leaf) node.toggle.setAttribute('aria-hidden', 'true'); else node.toggle.removeAttribute('aria-hidden');
+        node.toggle.tabIndex = leaf ? -1 : 0;
+      }
+    }));
+    this.markCurrent();
+  },
+
+  forget(path) {
+    const n = this.nodes.get(path);
+    if (n) n.li.remove();
+    for (const p of [...this.nodes.keys()]) if (p === path || p.startsWith(path + '/')) this.nodes.delete(p);
   },
 
   markCurrent() {
@@ -1814,6 +1870,333 @@ function openHelp() {
   else d.showModal();
 }
 
+// ------------------------------------------------------------------ library scans (indicator + dialog)
+
+// Server times arrive as ISO 8601 with the server's own UTC offset. Schedule times are the
+// server machine's wall clock, so they are shown as written, not converted to this browser.
+const serverWall = (iso) => (iso ? `${iso.slice(0, 10)} ${iso.slice(11, 16)}` : '—');
+const serverHM = (iso) => (iso ? iso.slice(11, 16) : '');
+function serverDay(iso, nowIso) {
+  if (!iso) return '';
+  if (nowIso && iso.slice(0, 10) === nowIso.slice(0, 10)) return `today ${serverHM(iso)}`;
+  const d = new Date(iso.slice(0, 10) + 'T12:00:00Z');
+  const wd = Number.isNaN(d.getTime()) ? iso.slice(0, 10) : d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+  return `${wd} ${serverHM(iso)}`;
+}
+function ago(iso) {
+  const t = Date.parse(iso || '');
+  if (!Number.isFinite(t)) return null;
+  const min = Math.max(0, (Date.now() - t) / 60000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${Math.floor(min)} min ago`;
+  const hrs = min / 60;
+  if (hrs < 48) return `${Math.floor(hrs)} h ago`;
+  return `${Math.floor(hrs / 24)} days ago`;
+}
+function fmtSpan(s) {
+  if (!isNum(s)) return '—';
+  s = Math.round(s);
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} m ${String(s % 60).padStart(2, '0')} s`;
+  return `${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')} m`;
+}
+const fmtOffset = (o) => (/^[+-]\d{4}$/.test(o || '') ? `UTC${o[0] === '-' ? MINUS : '+'}${o.slice(1, 3)}:${o.slice(3)}` : '');
+const lastLine = (lines) => { for (let i = (lines || []).length - 1; i >= 0; i--) { const l = lines[i].trim(); if (l && !l.startsWith('# ')) return l; } return ''; };
+
+const TRIGGER_LABEL = { schedule: 'Scheduled', 'catch-up': 'Catch-up', manual: 'Manual' };
+const POLL_RUNNING_MS = 2000;
+const POLL_IDLE_MS = 60000;
+const STATUS_RUNNING_MS = 3000;
+
+const scanUI = {
+  dlg: $('scans'),
+  ind: $('scan-ind'),
+  st: null, // latest {running, enabled, next_run_at, last_completed_at, trigger, started_at, progress}
+  data: null, // latest /api/scans
+  wasRunning: null,
+  timer: 0,
+  dirty: false,
+  viewing: null, // log file shown while no scan runs
+  autoLog: false,
+  liveName: null,
+  busy: false,
+
+  init() {
+    this.ind.addEventListener('click', () => this.open());
+    $('scans-close').addEventListener('click', () => this.dlg.close());
+    this.dlg.addEventListener('click', (e) => { if (e.target === this.dlg) this.dlg.close(); });
+    this.dlg.addEventListener('close', () => { this.viewing = null; this.liveName = null; this.autoLog = false; this.dirty = false; this.schedule(); });
+    for (const id of ['sc-enabled', 'sc-catchup']) {
+      $(id).addEventListener('click', () => {
+        const b = $(id);
+        b.setAttribute('aria-pressed', b.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+        this.markDirty();
+      });
+    }
+    $('sc-time').addEventListener('input', () => this.markDirty());
+    $('sc-form').addEventListener('submit', (e) => { e.preventDefault(); this.save(); });
+    $('sc-run').addEventListener('click', () => this.run());
+    $('sc-stop').addEventListener('click', () => this.stop());
+    $('sc-hist').addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-log]');
+      if (b) this.viewLog(b.dataset.log);
+    });
+  },
+
+  markDirty() {
+    this.dirty = true;
+    $('sc-time').disabled = $('sc-enabled').getAttribute('aria-pressed') !== 'true';
+    $('sc-save').disabled = !$('sc-time').value;
+  },
+
+  // Called with /api/status `scan` or derived from /api/scans; drives the top-bar indicator.
+  setState(st) {
+    this.st = st;
+    this.renderIndicator();
+    const running = !!st.running;
+    if (this.wasRunning === true && !running) this.finished();
+    this.wasRunning = running;
+    this.schedule();
+  },
+
+  renderIndicator() {
+    const st = this.st;
+    if (!st) return;
+    const ind = this.ind;
+    ind.classList.remove('hidden');
+    ind.classList.toggle('running', !!st.running);
+    $('scan-ind-spin').classList.toggle('hidden', !st.running);
+    $('scan-ind-clock').classList.toggle('hidden', !!st.running);
+    let text;
+    if (st.running) {
+      text = `Scanning… ${st.progress || ''}`.trim();
+      ind.title = `${st.trigger || 'manual'} scan running since ${serverWall(st.started_at)} (server time). Click for the live log.`;
+    } else {
+      const when = ago(st.last_completed_at);
+      text = when ? `Scanned ${when}` : 'Not scanned yet';
+      text += st.enabled && st.next_run_at ? ` · next ${serverHM(st.next_run_at)}` : ' · daily scan off';
+      ind.title = (st.last_completed_at ? `Last completed scan ${serverWall(st.last_completed_at)} (server time)` : 'No completed scan in the catalog') +
+        (st.enabled && st.next_run_at ? `; next ${serverWall(st.next_run_at)}` : '') + '. Click for schedule, history and logs.';
+    }
+    ind.classList.toggle('bad', !st.running && !st.last_completed_at);
+    $('scan-ind-text').textContent = text;
+  },
+
+  schedule() {
+    clearTimeout(this.timer);
+    const running = !!(this.st && this.st.running);
+    const open = this.dlg.open;
+    const ms = open ? (running ? POLL_RUNNING_MS : POLL_IDLE_MS) : (running ? STATUS_RUNNING_MS : POLL_IDLE_MS);
+    this.timer = setTimeout(() => this.poll(), ms);
+  },
+
+  async poll() {
+    if (this.dlg.open) await this.refresh();
+    else await loadStatus(); // renderStatus -> setState
+    this.schedule(); // also when the server is unreachable: keep trying
+  },
+
+  async refresh() {
+    try {
+      const d = await api('/api/scans');
+      this.render(d);
+    } catch (e) {
+      $('sc-run-state').textContent = `Couldn't load scans: ${e.message}`;
+      this.schedule();
+    }
+  },
+
+  open() {
+    if (this.dlg.open) return;
+    this.dirty = false;
+    this.viewing = null;
+    this.autoLog = true;
+    this.dlg.showModal();
+    if (this.data) this.render(this.data);
+    this.refresh();
+  },
+
+  stateFrom(d) {
+    return {
+      running: !!d.running, enabled: !!(d.schedule && d.schedule.enabled), next_run_at: d.next_run_at,
+      last_completed_at: d.last_completed_at, trigger: d.running ? d.running.trigger : null,
+      started_at: d.running ? d.running.started_at : null, progress: d.running ? lastLine(d.running.tail) : null,
+    };
+  },
+
+  render(d) {
+    this.data = d;
+    const sc = d.schedule || {};
+    const host = d.hostname || 'server';
+    const off = fmtOffset(d.utc_offset);
+    $('sc-clock').textContent = `${host} time${d.timezone ? ` (${d.timezone}${off ? ', ' + off : ''})` : ''} · now ${serverHM(d.server_time)}`;
+    $('sc-tz-short').textContent = `${host} time`;
+    if (!this.dirty) {
+      $('sc-enabled').setAttribute('aria-pressed', sc.enabled ? 'true' : 'false');
+      $('sc-catchup').setAttribute('aria-pressed', sc.catch_up ? 'true' : 'false');
+      if (document.activeElement !== $('sc-time')) $('sc-time').value = sc.time || '03:00';
+      $('sc-time').disabled = !sc.enabled;
+      $('sc-save').disabled = true;
+    }
+    const next = [];
+    if (!sc.enabled) next.push('The daily scan is off. Turn it on to keep the catalog current while this server runs.');
+    else {
+      next.push(`Next scan ${serverDay(d.next_run_at, d.server_time)} ${host} time${d.catch_up_at && d.catch_up_at === d.next_run_at ? ' (catching up on a missed scan)' : ''}.`);
+      if (sc.catch_up) next.push(`If the server was off at ${sc.time}, it scans ${fmtInt(d.startup_delay_minutes)} min after starting.`);
+    }
+    next.push(d.last_completed_at ? `Last completed scan: ${serverWall(d.last_completed_at)} (${ago(d.last_completed_at)}).` : 'No completed scan in the catalog yet.');
+    $('sc-next').textContent = next.join(' ');
+
+    const run = d.running;
+    $('sc-run').disabled = !!run || this.busy;
+    $('sc-stop').disabled = !run || this.busy;
+    const rs = $('sc-run-state');
+    if (run) rs.replaceChildren(h('span', { class: 'spinner small' }), `${TRIGGER_LABEL[run.trigger] || 'Manual'} scan running since ${serverHM(run.started_at)}`);
+    else if (!this.busy) rs.replaceChildren();
+
+    this.renderHistory(d.history || []);
+    if (run) {
+      this.viewing = null;
+      this.liveName = run.log;
+      this.showLog(run.log, run.tail || [], true);
+    } else if (this.liveName) {
+      const name = this.liveName; // the live scan ended: show its whole log
+      this.liveName = null;
+      this.viewLog(name);
+    } else if (this.autoLog && !this.viewing && d.history && d.history.length && d.history.find((x) => x.log)) {
+      this.autoLog = false;
+      this.viewLog(d.history.find((x) => x.log).log);
+    } else if (!this.viewing && !(d.history || []).some((x) => x.log)) {
+      this.showLog(null, [], false);
+    }
+    this.setState(this.stateFrom(d));
+  },
+
+  renderHistory(items) {
+    const tb = $('sc-hist');
+    if (!items.length) {
+      tb.replaceChildren(h('tr', null, h('td', { colspan: '11', class: 'empty-line', text: 'No scans run from this server yet.' })));
+      return;
+    }
+    const n = (r, k) => (r && isNum(r[k]) ? fmtInt(r[k]) : '—');
+    tb.replaceChildren(...items.map((it) => {
+      const r = it.run;
+      const label = it.outcome === 'failed' && it.exit_code != null ? `failed (${it.exit_code})` : it.outcome;
+      const tr = h('tr', { class: it.log && it.log === this.viewing ? 'viewing' : null },
+        h('td', { class: 'tnum', title: it.finished_at ? `${serverWall(it.started_at)} → ${serverWall(it.finished_at)}` : null, text: serverWall(it.started_at) }),
+        h('td', { text: it.trigger || '—' }),
+        h('td', null, h('span', { class: 'outcome ' + (it.outcome || ''), title: it.note || null, text: label || '—' })),
+        h('td', { class: 'r', text: fmtSpan(it.duration_s) }),
+        h('td', { class: 'r', text: n(r, 'scanned') }), h('td', { class: 'r', text: n(r, 'added') }),
+        h('td', { class: 'r', text: n(r, 'changed') }), h('td', { class: 'r', text: n(r, 'moved') }),
+        h('td', { class: 'r', text: n(r, 'missing') }), h('td', { class: 'r', text: n(r, 'errors') }),
+        h('td', null, it.log ? h('button', { type: 'button', class: 'linkish', dataset: { log: it.log }, title: it.log, text: 'View' }) : '—'));
+      return tr;
+    }));
+  },
+
+  showLog(name, lines, live) {
+    const pre = $('sc-log');
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    $('sc-log-title').textContent = name ? `${live ? 'Live log' : 'Log'} · ${name}` : 'Log';
+    const raw = $('sc-log-raw');
+    raw.classList.toggle('hidden', !name);
+    if (name) raw.href = '/api/scans/log/' + encodeURIComponent(name);
+    if (!name) pre.replaceChildren(h('span', { class: 'dim', text: 'No scan logs yet. Scan now, or wait for the daily scan.' }));
+    else pre.textContent = lines.join('\n');
+    if (atBottom || !live) pre.scrollTop = pre.scrollHeight;
+  },
+
+  async viewLog(name) {
+    if (this.data && this.data.running) return; // the live log has the floor
+    this.viewing = name;
+    if (this.data) this.renderHistory(this.data.history || []);
+    try {
+      const res = await fetch('/api/scans/log/' + encodeURIComponent(name));
+      if (!res.ok) throw new Error(`${res.status}`);
+      const text = await res.text();
+      if (this.viewing === name) this.showLog(name, text.replace(/\n$/, '').split('\n'), false);
+    } catch (e) {
+      if (this.viewing === name) $('sc-log').textContent = `Couldn't load ${name}: ${e.message}`;
+    }
+  },
+
+  async post(path, body) {
+    this.busy = true;
+    $('sc-run').disabled = true;
+    $('sc-stop').disabled = true;
+    try {
+      const d = await api(path, { method: 'POST', body: JSON.stringify(body || {}) });
+      this.busy = false;
+      if (d) this.render(d);
+      return d;
+    } finally {
+      this.busy = false;
+    }
+  },
+
+  async save() {
+    const time = $('sc-time').value;
+    if (!/^\d{2}:\d{2}/.test(time)) { toast('Pick a time for the daily scan', 'error'); return; }
+    const body = {
+      enabled: $('sc-enabled').getAttribute('aria-pressed') === 'true',
+      time: time.slice(0, 5),
+      catch_up: $('sc-catchup').getAttribute('aria-pressed') === 'true',
+    };
+    $('sc-save').disabled = true;
+    try {
+      this.dirty = false;
+      await this.post('/api/scans/schedule', body);
+      toast(body.enabled ? `Daily scan at ${body.time} saved` : 'Daily scan turned off');
+    } catch (e) {
+      this.dirty = true;
+      $('sc-save').disabled = false;
+      toast(`Couldn't save the schedule: ${e.message}`, 'error');
+    }
+  },
+
+  async run() {
+    $('sc-run-state').replaceChildren(h('span', { class: 'spinner small' }), 'Starting…');
+    try {
+      await this.post('/api/scans/run');
+    } catch (e) {
+      toast(e.status === 409 ? 'A scan is already running' : `Couldn't start a scan: ${e.message}`, 'error');
+      this.refresh();
+    }
+  },
+
+  async stop() {
+    $('sc-run-state').replaceChildren(h('span', { class: 'spinner small' }), 'Stopping…');
+    try {
+      await this.post('/api/scans/stop');
+      toast('Scan stopped; the next scan resumes where it left off');
+    } catch (e) {
+      toast(e.status === 409 ? 'No scan is running' : `Couldn't stop the scan: ${e.message}`, 'error');
+      this.refresh();
+    }
+  },
+
+  // A scan just ended: counts in the status line and the tree may have changed.
+  async finished() {
+    let last = null;
+    try {
+      const d = this.dlg.open && this.data && !this.data.running ? this.data : await api('/api/scans');
+      if (!this.dlg.open) this.data = d;
+      last = d && d.history && d.history[0];
+    } catch { /* toast without details */ }
+    await loadStatus();
+    tree.refreshCounts();
+    const r = last && last.run;
+    if (last && last.outcome === 'ok') {
+      const changes = r ? ['added', 'changed', 'moved', 'missing'].filter((k) => r[k] > 0).map((k) => `${fmtInt(r[k])} ${k}`) : [];
+      toast(changes.length ? `Scan finished: ${changes.join(', ')}` : 'Scan finished: no changes');
+      if (changes.length) list.reload();
+    } else if (last) {
+      toast(`Scan ${last.outcome}${last.note ? ': ' + last.note : ''}`, last.outcome === 'failed' ? 'error' : '');
+    }
+  },
+};
+
 // ------------------------------------------------------------------ keyboard
 
 function isTyping(el) {
@@ -1831,6 +2214,7 @@ function onKeyDown(e) {
     if (e.key === '?') { e.preventDefault(); $('help').close(); }
     return; // <dialog> handles Esc itself
   }
+  if (scanUI.dlg.open) return; // its inputs and buttons keep their keys; Esc closes it
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target;
   if (isTyping(t)) {
@@ -1917,7 +2301,7 @@ function wireKeys() {
   window.addEventListener('keydown', onKeyDown);
   // Space on a focused button must not also "click" it (keyup activates buttons).
   window.addEventListener('keyup', (e) => {
-    if ((e.key === ' ' || e.key === 'Spacebar') && !isTyping(e.target) && e.target.tagName === 'BUTTON') e.preventDefault();
+    if ((e.key === ' ' || e.key === 'Spacebar') && !isTyping(e.target) && e.target.tagName === 'BUTTON' && !e.target.closest('dialog')) e.preventDefault();
   });
   // Audio contexts need a user gesture; create ours on the first one.
   const unlock = () => player.ensureContext();
@@ -1979,6 +2363,7 @@ async function init() {
     wave.init();
     overview.init();
     detail.init();
+    scanUI.init();
     syncToggles();
     syncFilterUI();
     renderGain();

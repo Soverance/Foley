@@ -2,11 +2,15 @@
 
 Every studio-specific value (library root, quarantine, pack priorities) comes from
 config, never from code, so the repo stays publishable.
+
+Helpers shared with callers: parse_hhmm(value) -> "HH:MM" (ValueError if not a 24-hour
+time) and normalize_host(name) -> the lowercase host without port, brackets or trailing dot.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +43,13 @@ class Config:
     dedupe_keep_priority: list[str] = field(default_factory=list)
     testset: Path | None = None
     browse_loudness_target_lufs: float = -20.0  # [browse] loudness_target_lufs
+    browse_host: str = "127.0.0.1"  # [browse] host
+    browse_port: int = 8765  # [browse] port
+    browse_allowed_hosts: list[str] = field(default_factory=list)  # [browse] allowed_hosts
+    schedule_enabled: bool = False  # [schedule] enabled
+    schedule_time: str = "03:00"  # [schedule] time: "HH:MM", local time on the server
+    schedule_catch_up: bool = True  # [schedule] catch_up
+    schedule_startup_delay_minutes: float = 5.0  # [schedule] startup_delay_minutes
     source: Path | None = None  # the file this config was loaded from
 
     @property
@@ -74,6 +85,34 @@ def _path(value: str | None) -> Path | None:
     return Path(value) if value else None
 
 
+_HHMM = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")
+
+
+def parse_hhmm(value) -> str:
+    """A 24-hour "H:MM" / "HH:MM" time of day, normalized to "HH:MM"; ValueError if bad."""
+    m = _HHMM.fullmatch(value.strip()) if isinstance(value, str) else None
+    if not m:
+        raise ValueError(f'expected a 24-hour time like "03:00", got {value!r}')
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def normalize_host(value: str) -> str:
+    """A host name or IP as compared with a Host header: lowercase, without port,
+    brackets or trailing dot."""
+    text = str(value).strip().lower()
+    if text.startswith("["):
+        text = text[1 : text.find("]")] if "]" in text else text[1:]
+    elif text.count(":") == 1:
+        text = text.rsplit(":", 1)[0]
+    return text.rstrip(".")
+
+
+def _bool(value, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false, got {value!r}")
+    return value
+
+
 def from_dict(data: dict, source: Path | None = None) -> Config:
     library = data.get("library", {})
     storage = data.get("storage", {})
@@ -81,6 +120,7 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     dedupe = data.get("dedupe", {})
     evaluation = data.get("eval", {})
     browse = data.get("browse", {})
+    schedule = data.get("schedule", {})
     root = library.get("root")
     if not root:
         raise ConfigError("library.root is not set")
@@ -97,6 +137,27 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     cfg.browse_loudness_target_lufs = float(
         browse.get("loudness_target_lufs", cfg.browse_loudness_target_lufs)
     )
+    cfg.browse_host = str(browse.get("host", cfg.browse_host)).strip() or cfg.browse_host
+    port = browse.get("port", cfg.browse_port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise ConfigError(f"browse.port must be a port number (0-65535), got {port!r}")
+    cfg.browse_port = port
+    hosts = browse.get("allowed_hosts", [])
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        raise ConfigError("browse.allowed_hosts must be a list of host names")
+    cfg.browse_allowed_hosts = [n for n in (normalize_host(h) for h in hosts) if n]
+    cfg.schedule_enabled = _bool(schedule.get("enabled", cfg.schedule_enabled),
+                                 "schedule.enabled")
+    try:
+        cfg.schedule_time = parse_hhmm(schedule.get("time", cfg.schedule_time))
+    except ValueError as e:
+        raise ConfigError(f"schedule.time: {e}") from None
+    cfg.schedule_catch_up = _bool(schedule.get("catch_up", cfg.schedule_catch_up),
+                                  "schedule.catch_up")
+    delay = schedule.get("startup_delay_minutes", cfg.schedule_startup_delay_minutes)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0:
+        raise ConfigError(f"schedule.startup_delay_minutes must be >= 0, got {delay!r}")
+    cfg.schedule_startup_delay_minutes = float(delay)
     cfg.source = source
     check_data_dir(cfg)
     return cfg

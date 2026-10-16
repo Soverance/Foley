@@ -44,3 +44,31 @@ keep_priority = []
 # when its "loudness match" toggle is on, so quiet and hot files audition at the same
 # level. Playback gain only; files are never changed.
 loudness_target_lufs = -20
+
+# Where `foley browse` listens (--host/--port override these). The default keeps it on
+# this machine. To serve it to the studio network, bind every interface and list the
+# host names other machines will use (e.g. an internal DNS record pointing here).
+# Requests are answered only when their Host header is localhost, a loopback IP, one of
+# allowed_hosts (case-insensitive, port ignored) or, for a non-loopback bind, this
+# machine's own name or IP: other names get 403, which blocks DNS rebinding. Mind your
+# sample licences before serving the library beyond the people licensed to use it.
+host = "127.0.0.1"
+port = 8765
+allowed_hosts = []
+# host = "0.0.0.0"
+# port = 80
+# allowed_hosts = ["foley.example.lan"]
+
+[schedule]
+# Daily library scan run by `foley browse` while it is running (an incremental
+# `foley index`; read-only on the library). These are defaults: once someone saves the
+# schedule in the browser's Scans dialog, enabled/time/catch_up live in
+# <data_dir>/schedule.json and override this table (delete that file to fall back).
+enabled = false
+# Local wall-clock time on the machine running `foley browse`, 24-hour "HH:MM".
+time = "03:00"
+# If the server was not running at the scheduled time, scan after it starts when the
+# last completed scan is older than the most recent scheduled time...
+catch_up = true
+# ...this many minutes after start, so the network and the NAS are up after logon.
+startup_delay_minutes = 5

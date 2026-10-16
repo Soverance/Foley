@@ -2,16 +2,27 @@
 
 CONTRACT:
 
-    make_server(cfg, host="127.0.0.1", port=8765, verbose=False) -> BrowseServer
-        A bound (not yet serving) stdlib ThreadingHTTPServer; port 0 picks a free port.
-        Opens catalog.db once up front (creating/migrating it) so a broken catalog fails
-        here, not on the first request. `server.url` is "http://<host>:<port>/" and
-        `server.app` the BrowseApp holding the caches and the shortlist.
-    serve(cfg, host="127.0.0.1", port=8765, open_browser=True, out=None,
-          verbose=False) -> None
-        make_server + serve_forever until Ctrl+C. Prints the URL through `out`
-        (default: flushed print), with a loud warning when `host` is not loopback;
-        opens the default browser unless told not to; `verbose` logs every request.
+    make_server(cfg, host=None, port=None, verbose=False, scans=None) -> BrowseServer
+        A bound (not yet serving) stdlib ThreadingHTTPServer; host/port None take
+        cfg.browse_host / cfg.browse_port ([browse] host, port; defaults 127.0.0.1:8765);
+        port 0 picks a free port. Opens catalog.db once up front (creating/migrating it)
+        so a broken catalog fails here, not on the first request. Raises OSError when
+        the address cannot be bound (port in use). `server.url` is
+        "http://<host>:<port>/" and `server.app` the BrowseApp holding the caches, the
+        shortlist and `scans`: the given scans.ScanScheduler, else a new one (not started).
+    serve(cfg, host=None, port=None, open_browser=True, out=None, verbose=False,
+          schedule=True) -> None
+        make_server + serve_forever until Ctrl+C. Reports through the "foley.browse"
+        logger (and `out(line)` too when given): the URL; for a non-loopback bind a
+        one-line notice when [browse] allowed_hosts is set, else a loud WARNING. With
+        `schedule`, starts the scan scheduler (scans.ScanScheduler.start) and on exit
+        stops it, terminating a running scan. Opens the default browser unless told
+        not to; `verbose` logs every request line.
+    configure_logging(log_file=None) -> None
+        Handlers for the "foley" logger: the console (only when sys.stdout exists; it
+        is None under pythonw.exe) and, with `log_file`, a RotatingFileHandler
+        (LOG_MAX_BYTES x LOG_BACKUPS). Calling it again replaces the handlers it added.
+        Nothing in browse or scans prints; everything goes through logging.
     is_loopback(host: str) -> bool
 
     Helpers (pure, tested directly):
@@ -37,7 +48,9 @@ CONTRACT:
         GET  /static/<name>       whitelisted files of browse_ui/ (index.html, app.js, app.css)
         GET  /api/status          {library_root, assets: {active, missing, error, pending},
                                    note, has_tags, has_embeddings, shortlist_count,
-                                   loudness_target_lufs}
+                                   loudness_target_lufs, scan: ScanScheduler.status:
+                                   {running, enabled, next_run_at, last_completed_at,
+                                   trigger, started_at, progress (latest log line)}}
         GET  /api/tree?path=      {path, files, folders: [{name, path, count}]}: immediate
                                   children of a folder ("" = root); counts are active assets,
                                   recursive; `files` = active assets directly in the folder;
@@ -64,6 +77,29 @@ CONTRACT:
                                   unstar removes the entry; starring again with a note
                                   updates the note, without "note" keeps the old one.
 
+    Scans (see foley.scans; times are ISO 8601 with the server's UTC offset, slots are
+    the server machine's local wall-clock time):
+        GET  /api/scans           {schedule: {enabled, time "HH:MM", catch_up},
+                                   startup_delay_minutes, server_time, timezone (name),
+                                   utc_offset ("+0100"), hostname, next_run_at (null when
+                                   disabled; the pending catch-up if sooner), catch_up_at,
+                                   running: {trigger, started_at, log, tail: [lines]} | null,
+                                   history: [{trigger (schedule|catch-up|manual), outcome
+                                   (ok|failed|skipped|stopped), exit_code, started_at,
+                                   finished_at, duration_s, log, note, run_id, run: {id,
+                                   status, scanned, added, changed, moved, missing,
+                                   errors, analyzed, started_at, finished_at} | null}]
+                                   newest first, last_completed_at (any completed
+                                   index_runs row, CLI runs included)}
+        POST /api/scans/schedule  body {enabled?, time?, catch_up?} (validated; unknown keys
+                                  or bad values -> 400); saves data_dir/schedule.json;
+                                  returns the GET /api/scans payload
+        POST /api/scans/run       start a manual scan -> GET payload; 409 if one is running
+        POST /api/scans/stop      stop the running scan's process tree -> GET payload;
+                                  409 if none is running
+        GET  /api/scans/log/<name>  text/plain; only names matching scans.LOG_NAME that
+                                  exist in data_dir/logs (else 404)
+
     LISTING (/api/list): params folder, q, min_duration, max_duration, min_lufs, max_lufs,
         max_attack, is_music (1 = music, 0 = not known to be music: 0 or untagged), ext
         ("wav" or ".wav", comma-separated for several), starred=1, sort (relevance | name |
@@ -78,13 +114,17 @@ CONTRACT:
         so when the cap is hit), then filtered, and exact duplicates collapse to the
         best-ranked copy.
 
-    Security: requests whose Host header is not localhost / a loopback IP (or the
-    explicitly bound host) get 403 (DNS rebinding); a POST whose Origin is present and is
-    not this server gets 403. The client never sends filesystem paths: audio is located by
-    asset id, and `folder` is only compared as a path prefix (in memory, or as an escaped
+    Security: a request's Host header (case-insensitive, port ignored) must name
+    localhost / a loopback IP, the explicitly bound address, or an entry of [browse]
+    allowed_hosts; when bound to a non-loopback address, this machine's own host name,
+    FQDN and IPs are accepted too. Anything else gets 403 (DNS rebinding). A POST whose
+    Origin is present and is not http://<the request's Host> gets 403. The client never
+    sends filesystem paths: audio is located by asset id, log files by a whitelisted
+    name, and `folder` is only compared as a path prefix (in memory, or as an escaped
     SQL LIKE prefix through SearchFilters.folder). Nothing here writes to the library;
     writes go to cfg.data_dir only (image cache + `images` rows via images.render_overview,
-    peaks cache, shortlist.json).
+    peaks cache, shortlist.json, schedule.json, logs/). Scans run `foley index` in a
+    subprocess, which is read-only on the library like every `foley index`.
 
 DESIGN NOTES:
 
@@ -107,6 +147,8 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import logging
+import logging.handlers
 import math
 import os
 import socket
@@ -114,7 +156,6 @@ import sqlite3
 import sys
 import threading
 import time
-import traceback
 import wave
 from collections import Counter, OrderedDict, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -123,8 +164,11 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 
+from foley import scans as scans_mod
 from foley.catalog import db
-from foley.config import Config
+from foley.config import Config, normalize_host
+
+log = logging.getLogger("foley.browse")
 
 UI_DIR = Path(__file__).with_name("browse_ui")
 STATIC_FILES = {
@@ -152,7 +196,61 @@ SORTS = ("relevance", "name", "-name", "duration", "-duration", "lufs", "-lufs",
 _STREAM_CHUNK = 256 * 1024
 _PEAK_BLOCK = 1 << 18  # frames per soundfile read when streaming peaks
 _MAX_BODY = 64 * 1024
+_MAX_LOG_BYTES = 4 * 1024 * 1024  # GET /api/scans/log serves at most the last 4 MB
 _LOOPBACK_NAMES = frozenset({"localhost"})
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 5
+
+
+def configure_logging(log_file: str | os.PathLike | None = None) -> None:
+    logger = logging.getLogger("foley")
+    for handler in list(logger.handlers):
+        if getattr(handler, "_foley_browse", False):
+            logger.removeHandler(handler)
+            handler.close()
+    added: list[logging.Handler] = []
+    if sys.stdout is not None:  # None under pythonw.exe
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(logging.Formatter("%(message)s"))
+        added.append(console)
+    if log_file:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rotating = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8"
+        )
+        rotating.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        )
+        added.append(rotating)
+    if not added:
+        added.append(logging.NullHandler())
+    for handler in added:
+        handler._foley_browse = True
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def _machine_names() -> set[str]:
+    """This machine's host name, FQDN and IP addresses, as Host headers may carry them."""
+    names: set[str] = set()
+    try:
+        host = socket.gethostname()
+    except OSError:
+        return names
+    names.add(normalize_host(host))
+    try:
+        names.add(normalize_host(socket.getfqdn(host)))
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(host, None):
+            names.add(str(info[4][0]).split("%", 1)[0].lower())
+    except OSError:
+        pass
+    names.discard("")
+    return names
 
 
 def is_loopback(host: str) -> bool:
@@ -250,7 +348,7 @@ class Shortlist:
         try:
             self._data = _read_shortlist_file(self.path)
         except ValueError as e:
-            print(f"foley browse: ignoring unreadable shortlist: {e}", file=sys.stderr)
+            log.warning("ignoring unreadable shortlist: %s", e)
             self._data = {}
         self._stamp = stamp
         self.version += 1
@@ -646,10 +744,16 @@ class _HTTPError(Exception):
 class BrowseApp:
     """State shared by every request thread: config, caches, shortlist, locks."""
 
-    def __init__(self, cfg: Config, host: str = "127.0.0.1"):
+    def __init__(self, cfg: Config, host: str = "127.0.0.1",
+                 scans: scans_mod.ScanScheduler | None = None):
         self.cfg = cfg
-        bound = (host or "").strip().strip("[]").lower()
-        self.allowed_hosts = {bound} if bound and bound not in ("0.0.0.0", "::", "") else set()
+        bound = normalize_host(host or "")
+        self.allowed_hosts = set(cfg.browse_allowed_hosts)
+        if bound and bound not in ("0.0.0.0", "::"):
+            self.allowed_hosts.add(bound)
+        if bound and not is_loopback(bound):
+            self.allowed_hosts |= _machine_names()
+        self.scans = scans if scans is not None else scans_mod.ScanScheduler(cfg)
         self.shortlist = Shortlist(shortlist_path(cfg))
         self.peaks_dir = cfg.data_dir / "peaks"
         self.check_interval_s = CHECK_INTERVAL_S
@@ -710,7 +814,26 @@ class BrowseApp:
             "has_embeddings": has("embeddings"),
             "shortlist_count": len(self.shortlist.current()[1]),
             "loudness_target_lufs": float(self.cfg.browse_loudness_target_lufs),
+            "scan": self.scans.status(conn),
         }
+
+    # ----------------------------------------------------------------- scans
+
+    def scan_action(self, conn: sqlite3.Connection, action: str, body: dict) -> dict:
+        if action == "schedule":
+            try:
+                self.scans.update_settings(body)
+            except ValueError as e:
+                raise _HTTPError(400, str(e)) from e
+        elif action == "run":
+            if not self.scans.run_now("manual"):
+                raise _HTTPError(409, "a scan is already running")
+        elif action == "stop":
+            if not self.scans.stop():
+                raise _HTTPError(409, "no scan is running")
+        else:
+            raise _HTTPError(404, f"not found: /api/scans/{action}")
+        return self.scans.snapshot(conn)
 
     def tree(self, conn: sqlite3.Connection, path: str) -> dict:
         path = _norm_folder(path)
@@ -1110,8 +1233,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def log_message(self, format, *args) -> None:  # noqa: A002 - stdlib signature
+        # Through logging, never the stdlib's sys.stderr.write (None under pythonw.exe).
         if getattr(self.server, "verbose", False):
-            super().log_message(format, *args)
+            log.info("%s %s", self.address_string(), format % args)
 
     def _headers(self, status: int, ctype: str, length: int, extra: dict | None = None) -> None:
         self.send_response(status)
@@ -1139,15 +1263,11 @@ class _Handler(BaseHTTPRequestHandler):
                    headers)
 
     def _host_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").strip().lower()
-        if not host:
+        host = (self.headers.get("Host") or "").strip()
+        if not host or (host.startswith("[") and "]" not in host):
             return False
-        if host.startswith("["):
-            name = host[1 : host.find("]")] if "]" in host else ""
-        else:
-            name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-        name = name.rstrip(".")
-        return is_loopback(name) or name in self.app.allowed_hosts
+        name = normalize_host(host)
+        return bool(name) and (is_loopback(name) or name in self.app.allowed_hosts)
 
     def _origin_ok(self) -> bool:
         origin = self.headers.get("Origin")
@@ -1172,7 +1292,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if not self._host_ok():
                 self.close_connection = True
-                self._error(403, "forbidden host: foley browse only answers on localhost")
+                self._error(403, "forbidden host: foley browse answers only on localhost and "
+                                 "the host names in [browse] allowed_hosts")
                 return
             parts = urlsplit(self.path)
             path = unquote(parts.path)
@@ -1190,7 +1311,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (ConnectionError, TimeoutError):
             self.close_connection = True
         except Exception as e:  # noqa: BLE001
-            traceback.print_exc(file=sys.stderr)
+            log.exception("error handling %s %s", method, self.path)
             self._safe_error(500, f"internal error: {e.__class__.__name__}: {e}")
 
     def _safe_error(self, status: int, message: str) -> None:
@@ -1221,6 +1342,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(app.listing(self.conn, qs))
         if path == "/api/shortlist":
             return self._json(app.shortlist_items(self.conn))
+        if path == "/api/scans":
+            return self._json(app.scans.snapshot(self.conn))
+        if path.startswith("/api/scans/log/"):
+            return self._scan_log(path[len("/api/scans/log/") :])
         head, _, rest = path.strip("/").partition("/")
         kind, _, ident = rest.partition("/")
         if head == "api" and ident and "/" not in ident:
@@ -1236,13 +1361,25 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._peaks(self._id(ident), qs)
         raise _HTTPError(404, f"not found: {path}")
 
+    _SCAN_ACTIONS = {"/api/scans/schedule": "schedule", "/api/scans/run": "run",
+                     "/api/scans/stop": "stop"}
+
     def _route_post(self, path: str) -> None:
-        if path != "/api/shortlist":
+        if path != "/api/shortlist" and path not in self._SCAN_ACTIONS:
             raise _HTTPError(404, f"not found: {path}")
+        action = self._SCAN_ACTIONS.get(path)
+        body = self._body(optional=action in ("run", "stop"))
+        if action is None:
+            return self._json(self.app.set_star(self.conn, body))
+        self._json(self.app.scan_action(self.conn, action, body))
+
+    def _body(self, optional: bool = False) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError as e:
             raise _HTTPError(400, "bad Content-Length") from e
+        if optional and length == 0:
+            return {}
         if length <= 0 or length > _MAX_BODY:
             raise _HTTPError(400, "expected a small JSON body")
         raw = self.rfile.read(length)
@@ -1252,7 +1389,7 @@ class _Handler(BaseHTTPRequestHandler):
             raise _HTTPError(400, "body is not valid JSON") from e
         if not isinstance(body, dict):
             raise _HTTPError(400, "body must be a JSON object")
-        self._json(self.app.set_star(self.conn, body))
+        return body
 
     # ----------------------------------------------------------------- endpoints
 
@@ -1266,6 +1403,20 @@ class _Handler(BaseHTTPRequestHandler):
                 raise _HTTPError(404, f"not found: /static/{name}") from None
             body = _PLACEHOLDER
         self._send(200, body, STATIC_FILES[name], {"Cache-Control": "no-cache"})
+
+    def _scan_log(self, name: str) -> None:
+        path = scans_mod.log_path(self.app.cfg, name)
+        if path is None:
+            raise _HTTPError(404, f"no such scan log: {name}")
+        try:
+            with open(path, "rb") as fh:
+                size = os.fstat(fh.fileno()).st_size
+                if size > _MAX_LOG_BYTES:
+                    fh.seek(size - _MAX_LOG_BYTES)
+                body = fh.read(_MAX_LOG_BYTES)
+        except OSError as e:
+            raise _HTTPError(404, f"cannot read scan log {name}: {e}") from e
+        self._send(200, body, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
 
     def _peaks(self, aid: int, qs: dict) -> None:
         raw = (qs.get("n") or [""])[-1].strip()
@@ -1337,10 +1488,15 @@ class BrowseServer(ThreadingHTTPServer):
     # On Windows SO_REUSEADDR lets a second server bind the same port: keep it off there.
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, cfg: Config, host: str, port: int, verbose: bool = False):
-        self.app = BrowseApp(cfg, host)
+    def __init__(self, cfg: Config, host: str, port: int, verbose: bool = False,
+                 scans: scans_mod.ScanScheduler | None = None):
+        self.app = BrowseApp(cfg, host, scans=scans)
         self.verbose = verbose
         super().__init__((host, port), _Handler)
+
+    def handle_error(self, request, client_address) -> None:
+        # The stdlib prints to sys.stderr, which is None under pythonw.exe.
+        log.exception("unhandled error serving %s", client_address)
 
     @property
     def url(self) -> str:
@@ -1356,28 +1512,56 @@ class _BrowseServerV6(BrowseServer):
     address_family = socket.AF_INET6
 
 
-def make_server(cfg: Config, host: str = "127.0.0.1", port: int = 8765,
-                verbose: bool = False) -> BrowseServer:
+def make_server(cfg: Config, host: str | None = None, port: int | None = None,
+                verbose: bool = False,
+                scans: scans_mod.ScanScheduler | None = None) -> BrowseServer:
     db.open_catalog(cfg).close()  # create/migrate up front; fail fast on a broken catalog
-    host = host.strip().strip("[]")
+    host = (cfg.browse_host if host is None else host).strip().strip("[]")
+    port = cfg.browse_port if port is None else port
     if ":" in host:  # IPv6 literal
-        return _BrowseServerV6(cfg, host, port, verbose=verbose)
-    return BrowseServer(cfg, host, port, verbose=verbose)
+        return _BrowseServerV6(cfg, host, port, verbose=verbose, scans=scans)
+    return BrowseServer(cfg, host, port, verbose=verbose, scans=scans)
 
 
-def serve(cfg: Config, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
-          out=None, verbose: bool = False) -> None:
-    out = out or (lambda line: print(line, flush=True))
+def serve(cfg: Config, host: str | None = None, port: int | None = None,
+          open_browser: bool = True, out=None, verbose: bool = False,
+          schedule: bool = True) -> None:
+    def say(line: str, level: int = logging.INFO) -> None:
+        log.log(level, line)
+        if out is not None:
+            out(line)
+
+    from foley import __version__
+
+    host = (cfg.browse_host if host is None else host).strip()
+    port = cfg.browse_port if port is None else port
+    say(f"foley browse {__version__} starting (pid {os.getpid()}, config {cfg.source})")
     server = make_server(cfg, host, port, verbose=verbose)
     url = server.url
+    say(f"foley browse: listening on {host}:{server.server_address[1]}")
     if not is_loopback(host):
-        bar = "!" * 72
-        out(bar)
-        out(f"WARNING: foley browse is listening on {host}, not just this machine.")
-        out("The library's sample licences forbid hosting it for others; only requests")
-        out("addressed to localhost or the bound address are answered. Use 127.0.0.1.")
-        out(bar)
-    out(f"foley browse: {url}  (catalog {cfg.catalog_path}; Ctrl+C to stop)")
+        if cfg.browse_allowed_hosts:
+            port_part = "" if server.server_address[1] == 80 else f":{server.server_address[1]}"
+            names = ", ".join(cfg.browse_allowed_hosts)
+            say(f"foley browse: serving the local network at http://"
+                f"{cfg.browse_allowed_hosts[0]}{port_part}/ (answers Host: localhost, "
+                f"{names} and this machine's own names)")
+        else:
+            bar = "!" * 72
+            for line in (
+                bar,
+                f"WARNING: foley browse is listening on {host}, so other machines can reach it.",
+                "Sample licences usually forbid serving a library outside the licensee; only",
+                "requests addressed to localhost or this machine's own names/IPs are answered.",
+                "Set [browse] allowed_hosts in foley.toml for a studio host name, or use",
+                "127.0.0.1 to keep it on this machine.",
+                bar,
+            ):
+                say(line, logging.WARNING)
+    say(f"foley browse: {url}  (catalog {cfg.catalog_path}; Ctrl+C to stop)")
+    scheduler = server.app.scans
+    if schedule:
+        scheduler.start()
     if open_browser:
         import webbrowser
 
@@ -1385,6 +1569,8 @@ def serve(cfg: Config, host: str = "127.0.0.1", port: int = 8765, open_browser: 
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        out("foley browse: stopped")
+        say("foley browse: stopped")
     finally:
+        if schedule:
+            scheduler.shutdown(stop_running=True)
         server.server_close()

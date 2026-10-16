@@ -5,11 +5,16 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import logging
+import logging.handlers
 import shutil
+import socket
+import sys
 import threading
 import time
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 
 import audiogen as ag
@@ -17,7 +22,7 @@ import numpy as np
 import pytest
 from _catalog_builder import add_asset
 
-from foley import browse, images, status, sync
+from foley import browse, images, scans, status, sync
 from foley.catalog import db
 from foley.config import Config
 
@@ -30,6 +35,14 @@ ODD = {  # catalog-only rows (not on disk) for folder escaping, sorting and filt
     "odd/axb/y.wav": {"duration_s": 0.5},
     "odd/music/Theme Song.mp3": {"duration_s": 30.0, "is_music": 1, "lufs_integrated": -16.0},
 }
+# What the test servers' scan scheduler runs instead of a real `foley index`.
+SCAN_CMD = {"cmd": [sys.executable, "-c", "print('fake scan')"]}
+
+
+def fake_scans(cfg) -> scans.ScanScheduler:
+    sch = scans.ScanScheduler(cfg, command=lambda: SCAN_CMD["cmd"])
+    sch.poll_s = 0.05
+    return sch
 
 
 @pytest.fixture(scope="module")
@@ -46,13 +59,14 @@ def env(tmp_path_factory, _library_template):
         add_asset(conn, rel, features=feats, caption=f"caption for {rel}")
     conn.close()
 
-    server = browse.make_server(cfg, "127.0.0.1", 0)
+    server = browse.make_server(cfg, "127.0.0.1", 0, scans=fake_scans(cfg))
     server.app.check_interval_s = 0.0  # see catalog changes immediately
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield cfg, server
     finally:
+        server.app.scans.shutdown(stop_running=True)
         server.shutdown()
         server.server_close()
 
@@ -111,6 +125,9 @@ def test_status(env):
     assert st["loudness_target_lufs"] == -20.0
     assert isinstance(st["shortlist_count"], int) and "note" in st
     assert st["library_root"]
+    assert set(st["scan"]) == {"running", "enabled", "next_run_at", "last_completed_at",
+                               "trigger", "started_at", "progress"}
+    assert st["scan"]["running"] is False and st["scan"]["last_completed_at"]
 
 
 def test_tree_counts(env):
@@ -574,16 +591,27 @@ def test_cli_parses_browse_options():
     from foley import cli
 
     args = cli.build_parser().parse_args(["browse"])
-    assert (args.host, args.port, args.no_open) == ("127.0.0.1", 8765, False)
-    args = cli.build_parser().parse_args(["browse", "--port", "9000", "--no-open"])
-    assert (args.port, args.no_open) == (9000, True)
+    # None = take [browse] host / port from foley.toml (defaults 127.0.0.1:8765)
+    assert (args.host, args.port, args.no_open, args.log_file) == (None, None, False, None)
+    args = cli.build_parser().parse_args(["browse", "--port", "9000", "--no-open",
+                                          "--host", "0.0.0.0", "--log-file", "x.log"])
+    assert (args.host, args.port, args.no_open, args.log_file) == ("0.0.0.0", 9000, True, "x.log")
 
 
 def test_serve_warns_when_not_loopback(cfg, monkeypatch):
     lines: list[str] = []
 
+    class FakeScans:
+        def start(self):
+            lines.append("scheduler started")
+
+        def shutdown(self, stop_running=True):
+            lines.append(f"scheduler stopped (stop_running={stop_running})")
+
     class FakeServer:
         url = "http://0.0.0.0:1/"
+        server_address = ("0.0.0.0", 80)
+        app = SimpleNamespace(scans=FakeScans())
 
         def serve_forever(self, poll_interval=0.5):
             raise KeyboardInterrupt
@@ -594,9 +622,18 @@ def test_serve_warns_when_not_loopback(cfg, monkeypatch):
     monkeypatch.setattr(browse, "make_server", lambda *a, **k: FakeServer())
     browse.serve(cfg, host="0.0.0.0", port=1, open_browser=False, out=lines.append)
     assert any("WARNING" in line for line in lines) and lines[-1] == "closed"
+    assert "scheduler started" in lines and "scheduler stopped (stop_running=True)" in lines
     lines.clear()
-    browse.serve(cfg, host="127.0.0.1", port=1, open_browser=False, out=lines.append)
+    browse.serve(cfg, host="127.0.0.1", port=1, open_browser=False, out=lines.append,
+                 schedule=False)
+    assert not any("WARNING" in line for line in lines) and "scheduler started" not in lines
+    # with allowed_hosts configured, a non-loopback bind gets a one-line notice
+    lines.clear()
+    cfg.browse_allowed_hosts = ["foley.example.lan"]
+    browse.serve(cfg, host="0.0.0.0", port=80, open_browser=False, out=lines.append)
     assert not any("WARNING" in line for line in lines)
+    notices = [line for line in lines if "local network" in line]
+    assert len(notices) == 1 and "http://foley.example.lan/" in notices[0]
 
 
 def test_config_reads_browse_table(tmp_path):
@@ -606,6 +643,201 @@ def test_config_reads_browse_table(tmp_path):
                             "storage": {"data_dir": str(tmp_path / "data")},
                             "browse": {"loudness_target_lufs": -18}})
     assert cfg.browse_loudness_target_lufs == -18.0
-    cfg = config.from_dict({"library": {"root": str(tmp_path / "lib")},
-                            "storage": {"data_dir": str(tmp_path / "data")}})
+    base = {"library": {"root": str(tmp_path / "lib")},
+            "storage": {"data_dir": str(tmp_path / "data")}}
+    cfg = config.from_dict(base)
     assert cfg.browse_loudness_target_lufs == -20.0
+    assert (cfg.browse_host, cfg.browse_port, cfg.browse_allowed_hosts) == ("127.0.0.1", 8765, [])
+    cfg = config.from_dict({**base, "browse": {
+        "host": "0.0.0.0", "port": 80, "allowed_hosts": ["Foley.Example.LAN", "[fe80::1]:80"]}})
+    assert (cfg.browse_host, cfg.browse_port) == ("0.0.0.0", 80)
+    assert cfg.browse_allowed_hosts == ["foley.example.lan", "fe80::1"]
+    for bad in ({"port": "80"}, {"port": 70000}, {"port": True}, {"allowed_hosts": "x.lan"},
+                {"allowed_hosts": [1]}):
+        with pytest.raises(config.ConfigError):
+            config.from_dict({**base, "browse": bad})
+
+
+# ----------------------------------------------------------------------------- scans
+
+
+def _py(code: str) -> list[str]:
+    return [sys.executable, "-c", code]
+
+
+def _wait_idle(server, timeout=60) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = get_json(server, "/api/scans")
+        if snap["running"] is None:
+            return snap
+        time.sleep(0.1)
+    raise AssertionError("scan did not finish")
+
+
+def test_scans_api(env):
+    cfg, server = env
+    snap = get_json(server, "/api/scans")
+    assert set(snap) >= {"schedule", "server_time", "timezone", "utc_offset", "hostname",
+                         "next_run_at", "catch_up_at", "running", "history",
+                         "last_completed_at", "startup_delay_minutes"}
+    assert snap["schedule"] == {"enabled": False, "time": "03:00", "catch_up": True}
+    assert snap["next_run_at"] is None and snap["running"] is None
+    assert snap["last_completed_at"] and snap["server_time"] and snap["timezone"]
+
+    for bad in ({"time": "25:00"}, {"enabled": "yes"}, {"bogus": 1}, {"catch_up": None}):
+        err = get_json(server, "/api/scans/schedule", method="POST", body=bad, expect=400)
+        assert err["error"]
+    get_json(server, "/api/scans/schedule", method="POST", body=b"", expect=400)
+    try:
+        out = get_json(server, "/api/scans/schedule", method="POST",
+                       body={"enabled": True, "time": "4:30"})
+        assert out["schedule"] == {"enabled": True, "time": "04:30", "catch_up": True}
+        assert "T04:30:00" in out["next_run_at"]
+        assert (cfg.data_dir / "schedule.json").exists()
+        st = get_json(server, "/api/status")["scan"]
+        assert st["enabled"] is True and st["next_run_at"] == out["next_run_at"]
+    finally:
+        get_json(server, "/api/scans/schedule", method="POST", body={"enabled": False})
+    assert get_json(server, "/api/scans")["next_run_at"] is None
+
+    # a manual scan: 409 while it runs, live progress in /api/status, then history + log
+    get_json(server, "/api/scans/stop", method="POST", expect=409)
+    SCAN_CMD["cmd"] = _py("import time\nprint('scanning the fixture ...', flush=True)\n"
+                          "time.sleep(1.5)\nprint('run 999: scanned 0, added 0')")
+    started = get_json(server, "/api/scans/run", method="POST")
+    assert started["running"]["trigger"] == "manual"
+    get_json(server, "/api/scans/run", method="POST", body={}, expect=409)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        st = get_json(server, "/api/status")["scan"]
+        if st["progress"] == "scanning the fixture ...":
+            break
+        time.sleep(0.05)
+    assert st["running"] is True and st["trigger"] == "manual" and st["started_at"]
+    snap = _wait_idle(server)
+    last = snap["history"][0]
+    assert last["outcome"] == "ok" and last["trigger"] == "manual" and last["run_id"] == 999
+    assert last["run"] is None and last["duration_s"] >= 1.0  # no index_runs row 999
+    r, body = request(server, f"/api/scans/log/{last['log']}")
+    assert r.status == 200 and r.getheader("Content-Type").startswith("text/plain")
+    assert b"scanning the fixture" in body
+    for bad in ("scans.json", quote("../schedule.json", safe=""), "", "scan-1.log",
+                quote("..\\scans.json", safe="")):
+        r, _ = request(server, f"/api/scans/log/{bad}")
+        assert r.status == 404, bad
+
+    # stop
+    SCAN_CMD["cmd"] = _py("import time\nprint('long scan', flush=True)\ntime.sleep(120)")
+    get_json(server, "/api/scans/run", method="POST")
+    get_json(server, "/api/scans/stop", method="POST")
+    stopped = _wait_idle(server)["history"][0]
+    assert stopped["outcome"] == "stopped"
+
+
+def test_allowed_hosts_and_origin(env, tmp_path):
+    cfg, _ = env
+    cfg2 = Config(library_root=cfg.library_root, data_dir=tmp_path / "data",
+                  browse_allowed_hosts=["foley.example.lan"])
+    server = browse.make_server(cfg2, "127.0.0.1", 0, scans=fake_scans(cfg2))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        for host in ("foley.example.lan", "FOLEY.Example.LAN:80", "foley.example.lan.",
+                     f"foley.example.lan:{port}", f"localhost:{port}"):
+            get_json(server, "/api/scans", headers={"Host": host})
+        for host in ("other.example.lan", "foley.example.lan.evil.com", "example.lan",
+                     "[foley.example.lan"):
+            r, _ = request(server, "/api/status", headers={"Host": host})
+            assert r.status == 403, host
+
+        body = {"catch_up": False}
+        lan = {"Host": "foley.example.lan"}
+        get_json(server, "/api/scans/schedule", method="POST", body=body, expect=403,
+                 headers={**lan, "Origin": "http://evil.example.com"})
+        get_json(server, "/api/scans/schedule", method="POST", body=body, expect=403,
+                 headers={**lan, "Origin": f"http://localhost:{port}"})
+        get_json(server, "/api/scans/schedule", method="POST", body=body, expect=403,
+                 headers={**lan, "Origin": "https://foley.example.lan"})
+        out = get_json(server, "/api/scans/schedule", method="POST", body=body,
+                       headers={**lan, "Origin": "http://foley.example.lan"})
+        assert out["schedule"]["catch_up"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_machine_names_only_for_non_loopback_binds(tmp_path):
+    cfg = Config(library_root=tmp_path / "lib", data_dir=tmp_path / "data",
+                 browse_allowed_hosts=["foley.example.lan"])
+    me = socket.gethostname().lower()
+    wide = browse.BrowseApp(cfg, "0.0.0.0")
+    assert me in wide.allowed_hosts and "foley.example.lan" in wide.allowed_hosts
+    assert "0.0.0.0" not in wide.allowed_hosts
+    local = browse.BrowseApp(cfg, "127.0.0.1")
+    assert local.allowed_hosts == {"foley.example.lan", "127.0.0.1"}
+    assert browse.BrowseApp(cfg, "192.0.2.10").allowed_hosts >= {"192.0.2.10", me}
+
+
+@pytest.fixture
+def foley_logging():
+    logger = logging.getLogger("foley")
+    yield logger
+    for h in list(logger.handlers):
+        if getattr(h, "_foley_browse", False):
+            logger.removeHandler(h)
+            h.close()
+    logger.propagate = True
+    logger.setLevel(logging.NOTSET)
+
+
+def _ours(logger):
+    return [h for h in logger.handlers if getattr(h, "_foley_browse", False)]
+
+
+def test_configure_logging_without_console(foley_logging, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "stdout", None)  # as under pythonw.exe
+    monkeypatch.setattr(sys, "stderr", None)
+    path = tmp_path / "logs" / "browse.log"
+    browse.configure_logging(path)
+    handlers = _ours(foley_logging)
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], logging.handlers.RotatingFileHandler)
+    logging.getLogger("foley.scans").info("scan started")
+    logging.getLogger("foley.browse").error("boom")
+    browse.configure_logging(None)  # replaces, never stacks
+    assert [type(h) for h in _ours(foley_logging)] == [logging.NullHandler]
+    logging.getLogger("foley.browse").warning("dropped quietly")
+    text = path.read_text(encoding="utf-8")
+    assert "INFO    foley.scans: scan started" in text and "ERROR   foley.browse: boom" in text
+
+
+def test_browse_port_in_use_is_logged_and_exits_nonzero(foley_logging, tmp_path, monkeypatch):
+    from foley import cli
+
+    toml = tmp_path / "foley.toml"
+    toml.write_text(
+        f"[library]\nroot = '{(tmp_path / 'lib').as_posix()}'\n"
+        f"[storage]\ndata_dir = '{(tmp_path / 'data').as_posix()}'\n",
+        encoding="utf-8",
+    )
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    port = blocker.getsockname()[1]
+    log_file = tmp_path / "browse.log"
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    try:
+        rc = cli.main(["--config", str(toml), "browse", "--no-open", "--port", str(port),
+                       "--log-file", str(log_file)])
+    finally:
+        blocker.close()
+    assert rc == 2
+    text = log_file.read_text(encoding="utf-8")
+    assert "starting" in text and f"cannot serve on 127.0.0.1:{port}" in text
+
+    rc = cli.main(["--config", str(tmp_path / "nope.toml"), "browse", "--log-file",
+                   str(log_file)])
+    assert rc == 2 and "no foley.toml found" in log_file.read_text(encoding="utf-8")

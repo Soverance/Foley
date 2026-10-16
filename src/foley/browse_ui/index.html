@@ -18,6 +18,13 @@
       <span class="brand-name">Foley</span>
     </div>
     <div class="topbar-status" id="status-line" aria-live="polite">Connecting…</div>
+    <button type="button" class="scan-ind hidden" id="scan-ind" aria-haspopup="dialog" title="Library scans: schedule, history and logs">
+      <span class="scan-ind-icon" aria-hidden="true">
+        <span class="spinner small hidden" id="scan-ind-spin"></span>
+        <svg viewBox="0 0 24 24" id="scan-ind-clock"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      </span>
+      <span class="scan-ind-text" id="scan-ind-text">Scans</span>
+    </button>
     <div class="topbar-actions">
       <button type="button" class="btn ghost icon" id="help-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.1 9a3 3 0 1 1 4.2 2.8c-.8.4-1.3 1.1-1.3 2v.7"/><circle cx="12" cy="17.6" r=".6"/><circle cx="12" cy="12" r="10"/></svg>
@@ -287,6 +294,58 @@
         <h3>Mouse</h3>
         <p>Click or drag the waveform or the overview image to seek. Double-click a row to play it from the start. Shortcuts are ignored while you type in a field; press <kbd>Esc</kbd> to leave it.</p>
         <p>Loudness match plays each sound at the catalog target loudness (sounds too short for integrated LUFS are matched on true peak), clamped to −24…+12 dB.</p>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog class="help scans" id="scans" aria-labelledby="scans-title">
+    <div class="help-head">
+      <h2 id="scans-title">Library scans</h2>
+      <button type="button" class="btn ghost icon" id="scans-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="scans-body">
+      <section class="sc-section">
+        <h3>Daily scan <span class="sc-clock" id="sc-clock"></span></h3>
+        <form class="sc-form" id="sc-form" autocomplete="off">
+          <button type="button" class="toggle" id="sc-enabled" aria-pressed="false" title="Run `foley index` once a day while this server is running">Scan daily</button>
+          <label class="sc-time">at
+            <input type="time" id="sc-time" step="60" required aria-describedby="sc-clock">
+            <span class="muted" id="sc-tz-short"></span>
+          </label>
+          <button type="button" class="toggle" id="sc-catchup" aria-pressed="true" title="If the server was off at the scheduled time, scan a few minutes after it starts">Catch up after downtime</button>
+          <button type="submit" class="btn" id="sc-save" disabled>Save</button>
+        </form>
+        <p class="sc-note muted" id="sc-next"></p>
+      </section>
+
+      <section class="sc-section">
+        <div class="sc-run-row">
+          <button type="button" class="btn sc-primary" id="sc-run">Scan now</button>
+          <button type="button" class="btn" id="sc-stop" disabled>Stop</button>
+          <span class="sc-run-state" id="sc-run-state" aria-live="polite"></span>
+        </div>
+        <p class="sc-note muted">A scan is an incremental <code>foley index</code>: it reads the library, never changes it, and commits after every file. Stopping is safe; the next scan resumes where this one stopped.</p>
+        <div class="sc-log-head">
+          <span class="sc-log-title" id="sc-log-title">Log</span>
+          <a class="sc-log-raw hidden" id="sc-log-raw" target="_blank" rel="noopener">Open raw</a>
+        </div>
+        <pre class="sc-log" id="sc-log" tabindex="0" aria-label="Scan log"></pre>
+      </section>
+
+      <section class="sc-section">
+        <h3>History</h3>
+        <div class="sc-hist-wrap">
+          <table class="ledger-table sc-hist">
+            <thead><tr>
+              <th>When</th><th>Trigger</th><th>Outcome</th><th class="r">Duration</th>
+              <th class="r">Scanned</th><th class="r">Added</th><th class="r">Changed</th>
+              <th class="r">Moved</th><th class="r">Missing</th><th class="r">Errors</th><th>Log</th>
+            </tr></thead>
+            <tbody id="sc-hist"></tbody>
+          </table>
+        </div>
       </section>
     </div>
   </dialog>

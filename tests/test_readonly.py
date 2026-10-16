@@ -342,7 +342,7 @@ def _exercise_browse(cfg, ids: list[int], mp3: int) -> None:
         for path in ("/", "/api/status", "/api/tree", "/api/list", "/api/list?q=metal",
                      f"/api/asset/{ids[0]}", f"/api/audio/{ids[0]}",
                      f"/api/audio/{mp3}?transcode=1", f"/api/image/{ids[1]}",
-                     f"/api/peaks/{ids[0]}", f"/api/peaks/{mp3}?n=200"):
+                     f"/api/peaks/{ids[0]}", f"/api/peaks/{mp3}?n=200", "/api/scans"):
             call(path)
         call(f"/api/audio/{ids[0]}", headers={"Range": "bytes=10-99"})
         call("/api/shortlist", "POST", {"id": ids[0], "starred": True, "note": "x"})
