@@ -162,6 +162,18 @@ def cmd_dedupe(cfg, args) -> int:
     return 0
 
 
+def cmd_browse(cfg, args) -> int:
+    from foley import browse
+
+    try:
+        browse.serve(cfg, host=args.host, port=args.port, open_browser=not args.no_open,
+                     verbose=args.verbose)
+    except OSError as e:  # port in use, address not available, ...
+        print(f"foley: cannot serve on {args.host}:{args.port}: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="foley", description=__doc__)
     p.add_argument("--config", help="path to foley.toml")
@@ -218,6 +230,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("action", choices=["report"])
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_dedupe)
+
+    s = sub.add_parser("browse", help="local web UI to browse, search and audition the library")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="address to listen on (default 127.0.0.1; keep it on loopback)")
+    s.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    s.add_argument("--no-open", action="store_true", help="do not open a browser")
+    s.add_argument("--verbose", action="store_true", help="log every request")
+    s.set_defaults(func=cmd_browse)
     return p
 
 

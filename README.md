@@ -29,6 +29,17 @@ Register the MCP server with Claude Code in a project's `.mcp.json`:
 {"mcpServers": {"foley": {"command": "foley-mcp"}}}
 ```
 
+## foley browse
+
+`foley browse` starts a local web UI for people: browse the library's folders, search it, listen to files with loudness matching, and see Foley's analysis (waveform, spectrogram, caption, features, metadata, licence, duplicates, decisions) while you audition.
+
+```
+foley browse                 # http://127.0.0.1:8765/, opens your browser
+foley browse --port 9000 --no-open
+```
+
+It listens on 127.0.0.1 only and answers only requests addressed to localhost. Keep it that way: sample licences usually forbid serving a library to anyone else. Star files to put them on a shortlist (`shortlist.json` in the data folder, keyed by file content so stars survive moves); Claude Code reads it with the MCP tool `get_shortlist`. Set the loudness-match target with `[browse] loudness_target_lufs` in `foley.toml` (default -20). The browser never writes to the library. Everything it caches (peaks, images, the shortlist) lives in the data folder.
+
 ## Safety
 
 Foley treats the library as read-only. The only commands that change it are `foley dedupe apply`, `restore` and `purge`. They move duplicates to a quarantine folder rather than deleting them, verify every file byte for byte first, and log each action. No MCP tool can modify the library.

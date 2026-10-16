@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 from _catalog_builder import add_asset
 
-from foley import images, importer, mcp_server, status
+from foley import browse, images, importer, mcp_server, status
 from foley.catalog import db
 
 
@@ -48,7 +48,9 @@ def test_tools_registered_with_claude_facing_descriptions(server):
         "render_comparison",
         "import_to_project",
         "catalog_status",
+        "get_shortlist",
     }
+    assert "foley browse" in tools["get_shortlist"].description
     assert "keyword" in tools["search_audio"].description.lower()
     assert (
         "LUFS" in tools["search_audio"].description
@@ -153,6 +155,34 @@ def test_render_comparison_and_import_delegate(server, cfg, tmp_path, monkeypatc
         "target_lufs": None,
         "overwrite": False,
     }
+
+
+def test_get_shortlist_returns_starred_items(server, cfg):
+    assert payload(run(server.call_tool("get_shortlist", {}))) == {"count": 0, "items": []}
+    conn = db.open_catalog(cfg)
+    aid = conn.execute(
+        "SELECT id FROM assets WHERE rel_path = 'sfx/NailScratch19.wav'"
+    ).fetchone()[0]
+    conn.close()
+    browse.Shortlist(browse.shortlist_path(cfg)).set(
+        "hash-sfx/NailScratch19.wav", "old/place/NailScratch19.wav", True, "for boss hit?"
+    )
+    browse.Shortlist(browse.shortlist_path(cfg)).set(
+        "hash-gone", "sfx/deleted.wav", True, None
+    )
+    data = payload(run(server.call_tool("get_shortlist", {})))
+    assert data["count"] == 2
+    by_hash = {it["content_hash"]: it for it in data["items"]}
+    item = by_hash["hash-sfx/NailScratch19.wav"]
+    assert item["id"] == aid and item["path"] == "sfx/NailScratch19.wav"  # follows the move
+    assert item["note"] == "for boss hit?" and item["caption"] == "1.00 s nail scratch"
+    assert item["duration_s"] == 1.0 and item["lufs"] == -20.0
+    gone = by_hash["hash-gone"]
+    assert gone["id"] is None and gone["path"] == "sfx/deleted.wav"
+
+    browse.shortlist_path(cfg).write_text("{not json", encoding="utf-8")
+    with pytest.raises(mcp_server.ToolError, match="shortlist file is unreadable"):
+        mcp_server.tool_get_shortlist()
 
 
 def test_connection_reopens_when_catalog_replaced(server, cfg):

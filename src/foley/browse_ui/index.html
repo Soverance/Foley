@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Foley Browser</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath d=%27M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2%27 fill=%27none%27 stroke=%27%234fc1b0%27 stroke-width=%272.2%27 stroke-linecap=%27round%27 stroke-linejoin=%27round%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+<script type="module" src="/static/app.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand" aria-label="Foley">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg>
+      <span class="brand-name">Foley</span>
+    </div>
+    <div class="topbar-status" id="status-line" aria-live="polite">Connecting…</div>
+    <div class="topbar-actions">
+      <button type="button" class="btn ghost icon" id="help-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.1 9a3 3 0 1 1 4.2 2.8c-.8.4-1.3 1.1-1.3 2v.7"/><circle cx="12" cy="17.6" r=".6"/><circle cx="12" cy="12" r="10"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="banner hidden" id="banner" role="alert"></div>
+
+  <main class="panes" id="panes">
+
+    <!-- Left: library tree -->
+    <nav class="pane pane-tree" aria-label="Library folders">
+      <div class="pane-head"><span class="pane-title">Library</span></div>
+      <div class="tree-scroll" id="tree-scroll">
+        <button type="button" class="tree-special" id="shortlist-btn" data-view="shortlist">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
+          <span class="tree-label">Shortlist</span>
+          <span class="tree-count" id="shortlist-count">0</span>
+        </button>
+        <button type="button" class="tree-special" id="root-btn" data-view="root">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span class="tree-label">All sounds</span>
+          <span class="tree-count" id="root-count"></span>
+        </button>
+        <div class="tree-sep" role="presentation"></div>
+        <ul class="tree" id="tree" aria-label="Folders"></ul>
+      </div>
+    </nav>
+
+    <div class="resizer" data-resize="tree" role="separator" aria-orientation="vertical" aria-label="Resize folder pane" tabindex="-1"></div>
+
+    <!-- Middle: results -->
+    <section class="pane pane-results" aria-label="Results">
+      <div class="results-head">
+        <nav class="crumbs" id="crumbs" aria-label="Current folder"></nav>
+        <div class="search-row">
+          <label class="search" for="q">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+            <input id="q" type="search" placeholder="Search names, captions, metadata" autocomplete="off" spellcheck="false" aria-label="Search">
+            <kbd class="search-kbd" aria-hidden="true">/</kbd>
+          </label>
+          <label class="sort">
+            <span class="sr-only">Sort</span>
+            <select id="sort" aria-label="Sort results">
+              <option value="">Auto</option>
+              <option value="relevance">Relevance</option>
+              <option value="name">Name A–Z</option>
+              <option value="-name">Name Z–A</option>
+              <option value="duration">Shortest</option>
+              <option value="-duration">Longest</option>
+              <option value="lufs">Quietest</option>
+              <option value="-lufs">Loudest</option>
+              <option value="path">Path</option>
+            </select>
+          </label>
+        </div>
+        <div class="filters" id="filters" role="group" aria-label="Filters">
+          <div class="fgroup" title="Duration in seconds">
+            <span class="flabel">Dur</span>
+            <input type="number" class="num" id="f-min-dur" min="0" step="0.1" placeholder="min" aria-label="Minimum duration, seconds">
+            <span class="fdash">–</span>
+            <input type="number" class="num" id="f-max-dur" min="0" step="0.1" placeholder="max" aria-label="Maximum duration, seconds">
+            <span class="funit">s</span>
+          </div>
+          <div class="fgroup" title="Integrated loudness, LUFS">
+            <span class="flabel">LUFS</span>
+            <input type="number" class="num" id="f-min-lufs" step="1" placeholder="min" aria-label="Minimum loudness, LUFS">
+            <span class="fdash">–</span>
+            <input type="number" class="num" id="f-max-lufs" step="1" placeholder="max" aria-label="Maximum loudness, LUFS">
+          </div>
+          <div class="fgroup" title="Maximum attack time in seconds">
+            <span class="flabel">Attack ≤</span>
+            <input type="number" class="num" id="f-max-attack" min="0" step="0.005" placeholder="any" aria-label="Maximum attack, seconds">
+            <span class="funit">s</span>
+          </div>
+          <div class="seg" role="radiogroup" aria-label="Kind" id="f-kind">
+            <button type="button" role="radio" aria-checked="true" data-v="">All</button>
+            <button type="button" role="radio" aria-checked="false" data-v="0">SFX</button>
+            <button type="button" role="radio" aria-checked="false" data-v="1">Music</button>
+          </div>
+          <select id="f-ext" class="fselect" aria-label="File type">
+            <option value="">Any type</option>
+            <option value="wav">WAV</option>
+            <option value="flac">FLAC</option>
+            <option value="mp3">MP3</option>
+            <option value="ogg">OGG</option>
+            <option value="aif">AIF</option>
+            <option value="aiff">AIFF</option>
+          </select>
+          <button type="button" class="chip" id="f-starred" aria-pressed="false" title="Only starred">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
+            Starred
+          </button>
+          <button type="button" class="btn ghost small hidden" id="f-reset">Clear filters</button>
+        </div>
+      </div>
+
+      <div class="list-head" role="presentation">
+        <span class="col-star"></span>
+        <button type="button" class="col-name sorter" data-sort="name">Name</button>
+        <button type="button" class="col-dur sorter" data-sort="duration">Dur</button>
+        <button type="button" class="col-lufs sorter" data-sort="lufs">LUFS</button>
+        <span class="col-peak">Peak</span>
+      </div>
+
+      <div class="list-viewport" id="list" role="listbox" tabindex="0" aria-label="Sounds">
+        <div class="list-spacer" id="list-spacer"></div>
+        <div class="list-rows" id="list-rows"></div>
+        <div class="list-state hidden" id="list-state"></div>
+      </div>
+
+      <div class="results-foot" id="results-foot" aria-live="polite"></div>
+    </section>
+
+    <div class="resizer" data-resize="detail" role="separator" aria-orientation="vertical" aria-label="Resize detail pane" tabindex="-1"></div>
+
+    <!-- Right: detail -->
+    <section class="pane pane-detail" aria-label="Sound details" id="detail">
+      <div class="detail-empty" id="detail-empty">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12h2l2-6 3 12 3-15 3 18 3-12 2 3h2"/></svg>
+        <p class="detail-empty-title">Pick a sound to audition</p>
+        <p class="muted">Use <kbd>↑</kbd> <kbd>↓</kbd> to move through results. <kbd>Space</kbd> plays, <kbd>?</kbd> shows every shortcut.</p>
+      </div>
+
+      <div class="detail-body hidden" id="detail-body">
+        <div class="d-header">
+          <div class="d-title-row">
+            <h1 class="d-name" id="d-name"></h1>
+            <button type="button" class="star-btn big" id="d-star" aria-pressed="false" aria-label="Star (S)" title="Star (S)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"/></svg>
+            </button>
+          </div>
+          <nav class="d-crumbs" id="d-crumbs" aria-label="Folder of this sound"></nav>
+          <div class="d-path-row">
+            <code class="d-path" id="d-path"></code>
+            <button type="button" class="btn ghost small" id="d-copy" title="Copy full path">Copy path</button>
+          </div>
+          <div class="d-alert hidden" id="d-alert" role="status"></div>
+        </div>
+
+        <div class="wave-wrap" id="wave-wrap">
+          <canvas id="wave" class="wave" aria-label="Waveform. Click or drag to seek." role="img"></canvas>
+          <div class="wave-hover hidden" id="wave-hover"></div>
+          <div class="wave-msg" id="wave-msg"></div>
+          <button type="button" class="wave-fit" id="wave-fit" aria-pressed="false" title="Scale waveform to its peak">Fit</button>
+        </div>
+
+        <div class="overview" id="overview">
+          <img id="ov-img" alt="Foley overview: waveform with RMS envelope above a log-mel spectrogram" draggable="false">
+          <div class="ov-playhead hidden" id="ov-playhead"></div>
+          <div class="ov-msg" id="ov-msg"></div>
+        </div>
+
+        <section class="d-section">
+          <p class="d-caption" id="d-caption"></p>
+          <div class="tags" id="d-tags"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Shortlist note</h2>
+          <div class="note-row">
+            <textarea id="d-note" rows="2" placeholder="Why this one? (saving a note stars the sound)" aria-label="Shortlist note"></textarea>
+          </div>
+          <div class="note-status muted" id="d-note-status" aria-live="polite"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Analysis</h2>
+          <dl class="nums" id="d-nums"></dl>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Band energy <span class="d-h-sub">share of total energy</span></h2>
+          <div class="bands" id="d-bands"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Licence</h2>
+          <div id="d-license"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Duplicates <span class="d-h-sub" id="d-dupes-count"></span></h2>
+          <ul class="dupes" id="d-dupes"></ul>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Ledger</h2>
+          <div id="d-ledger"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Embedded metadata</h2>
+          <div id="d-meta"></div>
+        </section>
+
+        <section class="d-section">
+          <h2 class="d-h">Catalog record</h2>
+          <dl class="kv" id="d-record"></dl>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <!-- Transport -->
+  <footer class="transport" aria-label="Transport">
+    <div class="t-buttons">
+      <button type="button" class="tbtn" id="t-restart" aria-label="Play from start (Enter)" title="Play from start (Enter)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14"/><path d="M19 5 9 12l10 7z" class="fill"/></svg>
+      </button>
+      <button type="button" class="tbtn primary" id="t-play" aria-label="Play (Space)" title="Play / pause (Space)">
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-play"><path d="M7 4.5v15l12.5-7.5z" class="fill"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" class="ico-pause"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z" class="fill"/></svg>
+      </button>
+      <button type="button" class="tbtn" id="t-stop" aria-label="Stop (Esc)" title="Stop (Esc)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" class="fill"/></svg>
+      </button>
+    </div>
+    <div class="t-time" aria-live="off"><span id="t-cur">0:00.00</span><span class="t-sep">/</span><span id="t-dur">0:00.00</span></div>
+    <div class="t-now" id="t-now" title=""><span class="muted">Nothing loaded</span></div>
+    <div class="t-toggles">
+      <button type="button" class="toggle" id="t-loop" aria-pressed="false" title="Loop (L)">Loop <kbd>L</kbd></button>
+      <button type="button" class="toggle" id="t-autoplay" aria-pressed="true" title="Play each sound as you select it">Autoplay</button>
+      <button type="button" class="toggle" id="t-match" aria-pressed="true" title="Match loudness to the catalog target">Match loudness</button>
+      <span class="t-gain" id="t-gain" title="Gain applied by loudness match">0.0 dB</span>
+    </div>
+    <div class="t-vol">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4z" class="fill"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19 6a8.5 8.5 0 0 1 0 12"/></svg>
+      <input type="range" id="t-volume" min="0" max="100" step="1" value="80" aria-label="Master volume">
+      <span class="t-vol-val" id="t-volume-val">80</span>
+    </div>
+  </footer>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <dialog class="help" id="help" aria-labelledby="help-title">
+    <div class="help-head">
+      <h2 id="help-title">Keyboard shortcuts</h2>
+      <button type="button" class="btn ghost icon" id="help-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
+    </div>
+    <div class="help-grid">
+      <section>
+        <h3>Transport</h3>
+        <dl>
+          <dt><kbd>Space</kbd></dt><dd>Play / pause</dd>
+          <dt><kbd>Enter</kbd></dt><dd>Play from start</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Stop</dd>
+          <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Seek ±1 s (<kbd>Shift</kbd> ±5 s)</dd>
+          <dt><kbd>L</kbd></dt><dd>Loop on / off</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Browse</h3>
+        <dl>
+          <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Previous / next sound</dd>
+          <dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>Jump a page</dd>
+          <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>First / last sound</dd>
+          <dt><kbd>S</kbd></dt><dd>Star / unstar</dd>
+          <dt><kbd>/</kbd></dt><dd>Focus search (<kbd>↓</kbd> back to results)</dd>
+          <dt><kbd>?</kbd></dt><dd>This help</dd>
+        </dl>
+      </section>
+      <section class="help-wide">
+        <h3>Mouse</h3>
+        <p>Click or drag the waveform or the overview image to seek. Double-click a row to play it from the start. Shortcuts are ignored while you type in a field; press <kbd>Esc</kbd> to leave it.</p>
+        <p>Loudness match plays each sound at the catalog target loudness (sounds too short for integrated LUFS are matched on true peak), clamped to −24…+12 dB.</p>
+      </section>
+    </div>
+  </dialog>
+
+  <audio id="audio" preload="auto" hidden></audio>
+</div>
+</body>
+</html>

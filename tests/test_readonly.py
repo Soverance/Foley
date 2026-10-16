@@ -315,6 +315,44 @@ def test_hook_catches_library_writes(guard, library, tmp_path):
     assert len(guard["violations"]) == len(attempts)
 
 
+def _exercise_browse(cfg, ids: list[int], mp3: int) -> None:
+    """Every `foley browse` endpoint that touches the library or writes anything."""
+    import http.client
+    import json
+
+    from foley import browse
+
+    server = browse.make_server(cfg, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def call(path, method="GET", body=None, headers=None):
+        c = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=120)
+        try:
+            c.request(method, path, body=json.dumps(body) if body is not None else None,
+                      headers=headers or {})
+            r = c.getresponse()
+            data = r.read()
+            assert r.status in (200, 206), (path, r.status, data[:200])
+            return data
+        finally:
+            c.close()
+
+    try:
+        for path in ("/", "/api/status", "/api/tree", "/api/list", "/api/list?q=metal",
+                     f"/api/asset/{ids[0]}", f"/api/audio/{ids[0]}",
+                     f"/api/audio/{mp3}?transcode=1", f"/api/image/{ids[1]}",
+                     f"/api/peaks/{ids[0]}", f"/api/peaks/{mp3}?n=200"):
+            call(path)
+        call(f"/api/audio/{ids[0]}", headers={"Range": "bytes=10-99"})
+        call("/api/shortlist", "POST", {"id": ids[0], "starred": True, "note": "x"})
+        call("/api/shortlist")
+        call("/api/shortlist", "POST", {"id": ids[0], "starred": False})
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def _use_real_or_fake(monkeypatch, tmp_path) -> bool:
     from test_sync import install_fakes, siblings_ready
 
@@ -376,6 +414,7 @@ def test_every_entry_point_leaves_the_library_alone(
                 mcp_server.close()
                 mcp_server.set_config(None)
             assert (project / "sfx" / "c.wav").exists()
+            _exercise_browse(cfg, ids, mp3)
         conn.execute(
             "UPDATE assets SET status='missing', missing_since='2000-01-01T00:00:00' "
             "WHERE rel_path='sfx/click.wav'"

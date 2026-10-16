@@ -38,6 +38,7 @@ class Config:
     dedupe_retention_days: float = 30.0
     dedupe_keep_priority: list[str] = field(default_factory=list)
     testset: Path | None = None
+    browse_loudness_target_lufs: float = -20.0  # [browse] loudness_target_lufs
     source: Path | None = None  # the file this config was loaded from
 
     @property
@@ -79,6 +80,7 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     prune = data.get("prune", {})
     dedupe = data.get("dedupe", {})
     evaluation = data.get("eval", {})
+    browse = data.get("browse", {})
     root = library.get("root")
     if not root:
         raise ConfigError("library.root is not set")
@@ -92,6 +94,9 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
     cfg.dedupe_retention_days = float(dedupe.get("retention_days", cfg.dedupe_retention_days))
     cfg.dedupe_keep_priority = list(dedupe.get("keep_priority", []))
     cfg.testset = _path(evaluation.get("testset"))
+    cfg.browse_loudness_target_lufs = float(
+        browse.get("loudness_target_lufs", cfg.browse_loudness_target_lufs)
+    )
     cfg.source = source
     check_data_dir(cfg)
     return cfg

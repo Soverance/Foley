@@ -16,6 +16,16 @@ CONTRACT:
           analysis rate, 48 kHz -> 24 kHz, so all images share a y axis),
           fixed -80..0 dB range, one fixed colormap. Time axis labelled in seconds.
 
+    OVERVIEW_PLOT_X: tuple[float, float]
+        Horizontal fractions of the overview PNG (0 = left edge, 1 = right edge) where
+        the plot's time axis starts and ends: PANEL_LEFT_PX / OVERVIEW_W and
+        1 - PANEL_RIGHT_PX / OVERVIEW_W (62 px each side at 1024 px, about
+        0.0605..0.9395). t = 0 sits at the first value. The axis spans
+        max(duration, MIN_SPAN_S), so t = duration sits at the second value for any
+        clip of at least MIN_SPAN_S and proportionally before it for shorter ones.
+        Lets a UI draw a playhead over the image. Changing the panel margins changes
+        this constant and must bump IMAGE_VERSION.
+
     render_comparison(cfg, conn, asset_ids: list[int]) -> Path
         2-6 assets. One grid PNG of their overview images at identical scales,
         each labelled with asset id and filename, saved under
@@ -66,6 +76,11 @@ _GRID = "#c9d1d9"
 
 OVERVIEW_W, OVERVIEW_H = 1024, 512
 MIN_SPAN_S = 0.05
+# Panel margins at scale 1 (multiplied by the panel scale in grids).
+PANEL_LEFT_PX = 62
+PANEL_RIGHT_PX = 62  # with the dBFS colorbar (overviews)
+PANEL_RIGHT_PX_NO_COLORBAR = 16  # grids
+OVERVIEW_PLOT_X = (PANEL_LEFT_PX / OVERVIEW_W, 1.0 - PANEL_RIGHT_PX / OVERVIEW_W)
 _HZ_TICKS = [100, 500, 1000, 2000, 5000, 10000, 20000]
 
 
@@ -165,8 +180,8 @@ def _draw_panel(fig, clip: _Clip, box, span: float, label: str, scale: float,
 
     fs = 10.5 * scale
     small = 8.5 * scale
-    left = int(62 * scale)
-    right = int((62 if colorbar else 16) * scale)
+    left = int(PANEL_LEFT_PX * scale)
+    right = int((PANEL_RIGHT_PX if colorbar else PANEL_RIGHT_PX_NO_COLORBAR) * scale)
     head = int(46 * scale)
     gap = int(8 * scale)
     bottom = int(44 * scale)

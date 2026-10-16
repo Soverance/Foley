@@ -38,3 +38,9 @@ keep_priority = []
 [eval]
 # Hand-labeled test set (kept outside the repo). See eval/testset.example.toml.
 # testset = "C:/Users/me/AppData/Local/Foley/testset.toml"
+
+[browse]
+# `foley browse` (local web UI) plays every clip matched to this integrated loudness
+# when its "loudness match" toggle is on, so quiet and hot files audition at the same
+# level. Playback gain only; files are never changed.
+loudness_target_lufs = -20

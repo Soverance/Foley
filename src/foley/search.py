@@ -10,8 +10,11 @@ CONTRACT:
         UCS category/subcategory names are added, so "GOREMisc_Cladding_NailScratch19"
         is findable by "gore", "cladding", "nail scratch".
 
-    @dataclass SearchFilters: category, pack, is_music, min/max duration_s,
+    @dataclass SearchFilters: category, pack, folder, is_music, min/max duration_s,
         min/max lufs, min/max attack_s, include_missing=False
+        `folder` is a library-relative folder: only files under it (recursively) match.
+        It is applied as an escaped SQL LIKE prefix plus an exact rel_path range, so
+        `%` and `_` in folder names are literal and the match is case-sensitive.
 
     search(conn, query: str, filters: SearchFilters | None = None,
            project: str | None = None, limit: int = 20) -> dict
@@ -23,6 +26,13 @@ CONTRACT:
         groups (same content_hash) collapse to one result. `project` hides files with
         a `rejected` decision for that project. Only active assets unless
         include_missing.
+
+    rank(conn, query: str, filters: SearchFilters | None = None,
+         project: str | None = None, limit: int = 200) -> list[tuple[int, float]]
+        The ranking behind `search`, without collapsing or compacting: (asset id,
+        score) for up to `limit` FTS candidates, best first, exact duplicates kept.
+        Used by `foley browse` to page through every match. [] when the query has no
+        search terms (see query_terms).
 
     describe(conn, asset: int | str) -> dict
         By id or rel_path. Full record: asset fields, parsed metadata, features,
@@ -64,6 +74,7 @@ _CANDIDATE_FLOOR = 200
 class SearchFilters:
     category: str | None = None
     pack: str | None = None
+    folder: str | None = None
     is_music: bool | None = None
     min_duration_s: float | None = None
     max_duration_s: float | None = None
@@ -250,6 +261,11 @@ def _filter_sql(f: SearchFilters, project: str | None) -> tuple[list[str], list]
     if f.pack:
         where.append("lower(a.pack) LIKE ? ESCAPE '\\'")
         args.append("%" + _like_escape(f.pack.strip().lower()) + "%")
+    folder = (f.folder or "").replace("\\", "/").strip("/")
+    if folder:
+        # Exact, index-friendly range ('0' sorts right after '/') plus the escaped LIKE.
+        where.append("a.rel_path >= ? AND a.rel_path < ? AND a.rel_path LIKE ? ESCAPE '\\'")
+        args += [folder + "/", folder + "0", _like_escape(folder) + "/%"]
     if f.is_music is not None:
         where.append("f.is_music = ?")
         args.append(1 if f.is_music else 0)
@@ -296,6 +312,48 @@ def _rank_rows(
     return ranked
 
 
+def _keyword_candidates(
+    conn: sqlite3.Connection,
+    terms: list[str],
+    filters: SearchFilters,
+    project: str | None,
+    fetch: int,
+) -> list[tuple[float, sqlite3.Row]]:
+    where, args = _filter_sql(filters, project)
+    sql = (
+        _SELECT + ", bm25(search_fts, ?, ?, ?, ?, ?, ?) AS rank "
+        "FROM search_fts JOIN assets a ON a.id = search_fts.rowid "
+        "LEFT JOIN features f ON f.asset_id = a.id "
+        "WHERE search_fts MATCH ? AND " + " AND ".join(where) + " ORDER BY rank LIMIT ?"
+    )
+    rows = conn.execute(sql, [*BM25_WEIGHTS, _match_expression(terms), *args, fetch]).fetchall()
+    texts: dict[int, list[str]] = {}
+    if rows:
+        # json_each keeps this one bound parameter however many candidates there are.
+        for t in conn.execute(
+            "SELECT rowid, name, pack, category, metadata, tags, caption FROM search_fts "
+            "WHERE rowid IN (SELECT value FROM json_each(?))",
+            (json.dumps([r["id"] for r in rows]),),
+        ):
+            texts[t[0]] = list(t[1:])
+    return _rank_rows(rows, terms, texts)
+
+
+def rank(
+    conn: sqlite3.Connection,
+    query: str,
+    filters: SearchFilters | None = None,
+    project: str | None = None,
+    limit: int = 200,
+) -> list[tuple[int, float]]:
+    terms = query_terms(query)
+    if not terms:
+        return []
+    ranked = _keyword_candidates(conn, terms, filters or SearchFilters(), project,
+                                 max(1, int(limit)))
+    return [(row["id"], round(score, 3)) for score, row in ranked]
+
+
 def search(
     conn: sqlite3.Connection,
     query: str,
@@ -306,29 +364,12 @@ def search(
     filters = filters or SearchFilters()
     limit = max(1, int(limit))
     terms = query_terms(query)
-    where, args = _filter_sql(filters, project)
     fetch = max(limit * 10, _CANDIDATE_FLOOR)
 
     if terms:
-        sql = (
-            _SELECT + ", bm25(search_fts, ?, ?, ?, ?, ?, ?) AS rank "
-            "FROM search_fts JOIN assets a ON a.id = search_fts.rowid "
-            "LEFT JOIN features f ON f.asset_id = a.id "
-            "WHERE search_fts MATCH ? AND " + " AND ".join(where) + " ORDER BY rank LIMIT ?"
-        )
-        rows = conn.execute(sql, [*BM25_WEIGHTS, _match_expression(terms), *args, fetch]).fetchall()
-        texts: dict[int, list[str]] = {}
-        if rows:
-            ids = [r["id"] for r in rows]
-            marks = ",".join("?" * len(ids))
-            for t in conn.execute(
-                "SELECT rowid, name, pack, category, metadata, tags, caption FROM search_fts "
-                f"WHERE rowid IN ({marks})",
-                ids,
-            ):
-                texts[t[0]] = list(t[1:])
-        ranked = _rank_rows(rows, terms, texts)
+        ranked = _keyword_candidates(conn, terms, filters, project, fetch)
     else:
+        where, args = _filter_sql(filters, project)
         sql = (
             _SELECT + ", 0.0 AS rank FROM assets a "
             "LEFT JOIN features f ON f.asset_id = a.id "
@@ -365,8 +406,10 @@ def _compact(
     dupes = 0
     if row["content_hash"]:
         statuses = "('active', 'missing')" if include_missing else "('active')"
+        # `+status` keeps SQLite on the content_hash index; without ANALYZE statistics it
+        # otherwise walks every active row through assets_status (~8 ms per result).
         dupes = conn.execute(
-            f"SELECT COUNT(*) FROM assets WHERE content_hash = ? AND id != ? AND status IN {statuses}",  # noqa: E501
+            f"SELECT COUNT(*) FROM assets WHERE content_hash = ? AND id != ? AND +status IN {statuses}",  # noqa: E501
             (row["content_hash"], aid),
         ).fetchone()[0]
     return {

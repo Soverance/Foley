@@ -11,6 +11,11 @@ CONTRACT (Phase 1a tools; Phase 1b adds find_similar, Phase 2 the ledger tools):
     import_to_project(asset_id, project_root, dest, usage_key?, target_lufs?, overwrite=False)
         -> importer.import_to_project result
     catalog_status()                     -> status.catalog_status
+    get_shortlist()                      -> {"count": n, "items": [{id, path, note, caption,
+                                         duration_s, lufs, content_hash, added_at, status}]}
+                                         the files Scott starred in `foley browse`, newest
+                                         first (browse.shortlist_items over shortlist.json);
+                                         id is null when no catalog row has that file any more
 
     Results are compact JSON. Tool descriptions are written for Claude: say what each
     returns and when to use it. Config comes from foley.config.load() (FOLEY_CONFIG
@@ -49,7 +54,8 @@ INSTRUCTIONS = (
     "Foley indexes a sound library you cannot hear. Search it by words, look at spectrogram "
     "images, then import the chosen file into the game project. Typical flow: search_audio, "
     "render_comparison on the top 4-6 candidates (then view the PNG with your Read tool), "
-    "import_to_project. Durations are in seconds, loudness in LUFS, peaks in dBTP. "
+    "import_to_project. get_shortlist returns the sounds Scott starred after listening in "
+    "`foley browse`. Durations are in seconds, loudness in LUFS, peaks in dBTP. "
     "No tool modifies the audio library."
 )
 
@@ -233,6 +239,21 @@ def tool_catalog_status() -> dict:
         raise _fail(e) from e
 
 
+def tool_get_shortlist() -> dict:
+    from foley import browse
+
+    try:
+        cfg = get_config()
+        try:
+            data = browse.load_shortlist(cfg)
+        except ValueError as e:
+            raise ToolError(f"the shortlist file is unreadable: {e}") from e
+        items = browse.shortlist_items(get_conn(), data)
+        return {"count": len(items), "items": items}
+    except Exception as e:  # noqa: BLE001
+        raise _fail(e) from e
+
+
 # ----------------------------------------------------------------------------- server
 
 SEARCH_DESCRIPTION = (
@@ -278,6 +299,15 @@ STATUS_DESCRIPTION = (
     "Catalog health: asset counts by status, last scan time, pending files, archives not "
     "extracted, duplicate groups and reclaimable bytes, used-but-missing sources, model "
     "versions and files that failed analysis. Call it when search results look stale or empty."
+)
+SHORTLIST_DESCRIPTION = (
+    "The sounds Scott starred while auditioning in `foley browse` (the local web UI where "
+    "he can actually listen), newest first. Each item: id (asset id for describe / "
+    "render_comparison / import_to_project; null if the file is no longer in the catalog), "
+    "library-relative path, his note (often the intended use, e.g. 'for boss hit?'), "
+    "caption, duration_s (seconds), lufs (integrated LUFS; null under 0.4 s), content_hash, "
+    "added_at and status. Call it when Scott says he picked or starred sounds, before "
+    "searching for something he may already have chosen."
 )
 
 
@@ -338,6 +368,10 @@ def build_server():
     @server.tool(name="catalog_status", description=STATUS_DESCRIPTION)
     async def catalog_status() -> dict:
         return tool_catalog_status()
+
+    @server.tool(name="get_shortlist", description=SHORTLIST_DESCRIPTION)
+    async def get_shortlist() -> dict:
+        return tool_get_shortlist()
 
     return server
 
