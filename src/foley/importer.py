@@ -16,7 +16,7 @@ CONTRACT:
                       overwrite: bool = False, decided_by: str = "claude-code") -> dict
         dest is a res:// path (or a path relative to project_root). Refuses to
         overwrite unless overwrite=True. Never writes outside project_root.
-        Normalization rules (docs/handoffs/AudioCatalog.md, MCP tool surface):
+        Normalization rules (docs/design.md, "Claude Code integration"):
           target = target_lufs or the project config target for usage_key or None;
           clips >= 0.4 s use integrated LUFS, shorter use true peak -> oneshot_peak_db;
           lossless sources (wav, flac, aif) are written normalized in their own format

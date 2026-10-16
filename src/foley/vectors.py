@@ -5,8 +5,10 @@ CONTRACT:
     clap_api() -> module | None
         The `foley.models.clap` interface (CLAP_CHECKPOINTS, DEFAULT_CLAP, model_key,
         text_encoder), imported lazily once per process (the result, module or None, is
-        kept); None when it cannot be imported (models not installed). Callers check for
-        embeddings first so a catalog without any never imports it (it may pull in torch).
+        kept); None when it cannot be imported or the models extra is not installed
+        (foley.models.factory().unavailable(), checked on every call without importing
+        torch). Callers check for embeddings first so a catalog without any never
+        imports it.
         Tests replace this function with a fake implementing the interface.
     model_key(short_name) -> str | None      clap_api().model_key, None if unavailable
     checkpoints() -> list[str]               short names of CLAP_CHECKPOINTS ([] if none)
@@ -85,6 +87,11 @@ def clap_api():
         except Exception:  # noqa: BLE001 - not installed / broken install: keyword-only
             module = None
         _api[:] = [module]
+    if _api[0] is not None:
+        from foley import models
+
+        if models.factory().unavailable():
+            return None  # no torch/transformers: the text encoder can never load
     return _api[0]
 
 
@@ -149,7 +156,8 @@ def embed_text(short_name: str, text: str) -> np.ndarray:
     api = clap_api()
     try:
         if api is None:
-            raise EncoderUnavailable("the CLAP models are not installed (foley.models)")
+            raise EncoderUnavailable("the CLAP models are not installed (the optional "
+                                    "`models` extra)")
         encoder = api.text_encoder(short_name)
         vec = np.asarray(encoder.embed_text([text]), dtype=np.float32).reshape(-1)
     except Exception as e:  # noqa: BLE001

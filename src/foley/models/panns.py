@@ -37,13 +37,14 @@ shorter than CNN14 can take at all (0.31 s, where the reference raises). Files o
 10 s therefore get exactly the reference output (verified: max |diff| 1e-5).
 
 The architecture is vendored from https://github.com/qiuqiangkong/audioset_tagging_cnn
-(pytorch/models.py, Cnn14), Copyright (c) 2020 Qiuqiang Kong, MIT License. The log-mel
+(pytorch/models.py, Cnn14), Copyright (c) 2018-2020 Qiuqiang Kong, MIT License. The log-mel
 front end reproduces torchlibrosa's Spectrogram/LogmelFilterBank (MIT) with the
 convolution kernels and mel matrix stored in the checkpoint, so it is the reference front
 end exactly. The pretrained weights (Kong et al., "PANNs: Large-Scale Pretrained Audio
 Neural Networks for Audio Pattern Recognition", 2020; https://zenodo.org/records/3987831)
-are licensed CC BY 4.0. The AudioSet ontology label list (Google, CC BY 4.0) is
-downloaded from the AudioSet site.
+are licensed CC BY 4.0. The AudioSet label list is downloaded from Google's AudioSet
+storage (dataset CC BY 4.0; the class names come from the ontology, CC BY-SA 4.0). See
+THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations

@@ -213,7 +213,7 @@ def _with_chunks(wav: bytes, *chunks: bytes) -> bytes:
 def _bext(description: str, version: int = 2) -> bytes:
     b = bytearray(602)
     b[0:len(description)] = description.encode()
-    b[256:262] = b"Scott\x00"
+    b[256:267] = b"Foley Test\x00"
     b[320:330] = b"2026-10-14"
     b[330:338] = b"12:00:00"
     struct.pack_into("<IIH", b, 338, 48000, 0, version)
@@ -222,7 +222,7 @@ def _bext(description: str, version: int = 2) -> bytes:
 
 
 IXML = b"""<?xml version="1.0" encoding="UTF-8"?>
-<BWFXML><IXML_VERSION>2.10</IXML_VERSION><PROJECT>Endless</PROJECT><NOTE>metal hit</NOTE>
+<BWFXML><IXML_VERSION>2.10</IXML_VERSION><PROJECT>MyGame</PROJECT><NOTE>metal hit</NOTE>
 <USER><CATEGORY>METAL</CATEGORY><SUBCATEGORY>IMPACT</SUBCATEGORY>
 <KEYWORDS>shelf, clang</KEYWORDS><FXNAME>Shelf Hit</FXNAME></USER></BWFXML>\x00\x00"""
 
@@ -241,19 +241,19 @@ def test_read_metadata_bext_ixml_info():
         _pcm_wav(),
         _chunk(b"bext", _bext("Metal shelf hit, close")),
         _chunk(b"iXML", IXML),
-        _chunk(b"LIST", _info(title="Shelf Hit", artist="Soverance", comment="odd")),
+        _chunk(b"LIST", _info(title="Shelf Hit", artist="Foley Test", comment="odd")),
     )
     meta = scan.read_metadata(data, ".wav", "packs/P/GOREMisc_Splat_ME_Lib.wav")
     assert meta["bext"]["description"] == "Metal shelf hit, close"
-    assert meta["bext"]["originator"] == "Scott"
+    assert meta["bext"]["originator"] == "Foley Test"
     assert meta["bext"]["origination_date"] == "2026-10-14"
     assert meta["bext"]["loudness_value"] == -23.0
     assert meta["bext"]["coding_history"].startswith("A=PCM")
     assert meta["ixml"] == {
-        "project": "Endless", "note": "metal hit", "category": "METAL",
+        "project": "MyGame", "note": "metal hit", "category": "METAL",
         "subcategory": "IMPACT", "keywords": "shelf, clang", "fxname": "Shelf Hit",
     }
-    assert meta["info"] == {"title": "Shelf Hit", "artist": "Soverance", "comment": "odd"}
+    assert meta["info"] == {"title": "Shelf Hit", "artist": "Foley Test", "comment": "odd"}
     assert meta["ucs"]["cat_id"] == "GOREMisc"
     assert "warnings" not in meta
     json.dumps(meta)

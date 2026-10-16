@@ -13,6 +13,9 @@ CONTRACT:
           duplicates: {exact_groups, reclaimable_bytes, audio_identical_groups},
           used_but_missing: [{rel_path, project}],   # ledger usages whose asset is missing
           models: {
+            installed: bool,                       # the optional `models` extra (torch,
+            note: str | None,                      # transformers); note says how to
+                                                   # install it when it is missing
             tags: {model, done, pending},          # active assets tagged by that model
             embeddings: {<model key>: {name, done, pending}},   # [models] clap, plus any
                                                    # other model with embeddings rows
@@ -84,10 +87,11 @@ def _archives_not_extracted(conn: sqlite3.Connection) -> list[str]:
 
 def _model_progress(cfg: Config, conn: sqlite3.Connection, active: int) -> dict:
     """How far the model stages (enrichment, not gating `active`) have got."""
-    from foley import sync
+    from foley import models, sync
     from foley.models import clap, panns
 
     versions = sync.stage_versions(cfg)
+    missing = models.factory().unavailable()
     tagged = conn.execute(
         "SELECT count(*) FROM assets a JOIN asset_stages s ON s.asset_id = a.id "
         "AND s.stage = 'tags' AND s.version = ? WHERE a.status = 'active'",
@@ -100,6 +104,8 @@ def _model_progress(cfg: Config, conn: sqlite3.Connection, active: int) -> dict:
     keys = [clap.model_key(n) for n in clap_checkpoints(cfg)]
     keys += sorted(k for k in have if k not in keys)
     return {
+        "installed": missing is None,
+        "note": f"model stages are skipped: {missing}" if missing else None,
         "tags": {"model": panns.MODEL_KEY, "done": tagged, "pending": max(active - tagged, 0)},
         "embeddings": {
             k: {"name": clap.short_name_for_key(k), "done": have.get(k, 0),

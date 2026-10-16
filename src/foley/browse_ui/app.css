@@ -1060,3 +1060,14 @@ option { background: #0a1534; color: var(--ink); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* "Similar to <name>": keep the label and at least part of the name visible, ellipsize the name. */
+.crumbs .crumb-current:has(.crumb-src) { display: flex; align-items: center; min-width: 22ch; }
+.crumbs .crumb-current .crumb-label { flex: none; }
+.crumbs .crumb-current .crumb-src { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crumbs .crumb-back { flex: none; }
+
+/* Test-set mode: the Good answer button takes its own line instead of squeezing the title. */
+.d-title-row { flex-wrap: wrap; }
+.d-name { flex: 1 1 calc(100% - 100px); }
+.d-title-row .good-btn { order: 5; margin-top: 2px; }

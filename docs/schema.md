@@ -111,7 +111,7 @@ Written by the Sound Board and by Claude Code (`record_decision`).
 | Column | Notes |
 | --- | --- |
 | `content_hash`, `rel_path` | The audio judged, and where it was at the time |
-| `project` | e.g. `endless-reach` |
+| `project` | e.g. `my-game` |
 | `usage_key` | Game-side slot, e.g. `sfx.weapon.laser.fire`. Decisions are per slot, not global |
 | `verdict` | `approved`, `rejected`, `replaced`, `auto` (picked by Claude Code without review) |
 | `gain_db` | Level change, if any |

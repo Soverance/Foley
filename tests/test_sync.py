@@ -387,7 +387,7 @@ def test_moved_file_keeps_id_and_analysis(cfg, library, fakes):
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO ledger.decisions(content_hash, rel_path, project, usage_key, verdict, "
-            "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.gore', 'approved', 'scott', ?)",
+            "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.gore', 'approved', 'reviewer', ?)",
             (before["content_hash"], GORE, db.utcnow()),
         )
     feats_sql = "SELECT * FROM features WHERE asset_id=?"
@@ -1351,7 +1351,7 @@ def test_folder_rename_moves_without_reads(cfg, library, fakes):
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO ledger.decisions(content_hash, rel_path, project, usage_key, verdict, "
-            "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.hit', 'approved', 'scott', ?)",
+            "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.hit', 'approved', 'reviewer', ?)",
             (before["content_hash"], old_rel, db.utcnow()),
         )
     conn.close()

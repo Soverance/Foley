@@ -22,7 +22,9 @@ CONTRACT:
         `foley index` runs STAGES when [models] enabled (default), else CORE_STAGES;
         `--stage tags` / `--stage embeddings` always work. If a model cannot be loaded
         (no weights, download failure, broken torch), its stage is skipped for the run
-        with a note, before any file is read for it; the core stages proceed.
+        with a note, before any file is read for it; the core stages proceed. Without
+        the optional `models` extra (foley.models.factory().unavailable()), both model
+        stages are skipped with a single note saying how to install it.
         "tags" writes the tags rows (every AudioSet label >= panns.TAG_MIN_SCORE,
         replacing the asset's previous tags) and features.is_music, and rewrites the
         asset's caption and search_fts row in the same transaction (their stage rows are
@@ -46,7 +48,7 @@ CONTRACT:
     run_index(cfg, stages: list[str] | None = None, force: bool = False,
               limit: int | None = None, progress: Callable[[str], None] | None = None,
               allow_mass_missing: bool = False, workers: int | None = None) -> RunSummary
-        Implements "Library sync" in docs/handoffs/AudioCatalog.md exactly:
+        Implements "Library sync" in docs/design.md exactly:
         lock file (IndexLocked if held by a live process; stale locks recovered),
         index_runs row, scan, diff by (rel_path, size, mtime_ns), settle window,
         move detection by content hash against `missing` assets, missing marking,
@@ -820,12 +822,17 @@ class _Models:
         """Load the models for `wanted` stages; returns the stages that cannot run."""
         from foley import models as m
 
+        f = m.factory()
+        missing = f.unavailable()
+        if missing:  # one note for the run, not one failure per model
+            self._note(f"model stages skipped this run ({', '.join(sorted(wanted))}): "
+                       f"{missing}")
+            return set(wanted)
         try:
-            self.device = m.resolve_device(self.cfg.models_device)
+            self.device = f.resolve_device(self.cfg.models_device)
         except Exception as e:  # noqa: BLE001
             self._note(f"model stages skipped this run: {e}")
             return set(wanted)
-        f = m.factory()
         disabled: set[str] = set()
         if "tags" in wanted:
             t0 = time.monotonic()

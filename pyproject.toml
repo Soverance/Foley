@@ -4,9 +4,30 @@ version = "0.1.0"
 description = "Index a sound library so Claude Code can search, inspect and pick audio it cannot hear"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "src/foley/browse_ui/fonts/*-OFL.txt",
+]
 requires-python = ">=3.12"
 authors = [{ name = "Soverance Studios" }]
+keywords = [
+    "audio",
+    "sound effects",
+    "game development",
+    "mcp",
+    "claude",
+    "clap",
+    "audioset",
+    "sqlite",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
@@ -19,11 +40,21 @@ dependencies = [
     "pillow>=10.0",
     "matplotlib>=3.8",
     "mcp>=2.3",
-    # Phase 1b models (PANNs CNN14 tags, CLAP embeddings). torch comes from the CUDA
-    # wheel index on Windows and Linux (see [tool.uv.sources]) and from PyPI elsewhere.
+]
+
+[project.optional-dependencies]
+# The model stages (PANNs CNN14 tags, CLAP embeddings) and semantic search:
+# `uv sync --extra models`. Without them `foley index` skips those stages and search is
+# keyword-only. torch comes from the CUDA wheel index on Windows and Linux (see
+# [tool.uv.sources]) and from PyPI on macOS.
+models = [
     "torch>=2.6",
     "transformers>=4.45",
 ]
+
+[project.urls]
+Repository = "https://github.com/soverance/foley"
+Issues = "https://github.com/soverance/foley/issues"
 
 [project.scripts]
 foley = "foley.cli:main"

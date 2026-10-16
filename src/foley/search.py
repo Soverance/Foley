@@ -606,7 +606,7 @@ def _add_vectors(conn, text, filters, project, fetch, resolved, models, restrict
     name = resolved.clap_model
     if resolved.model_key is None:
         why = f"CLAP model {name!r} is unknown" if name and vectors.clap_api() else \
-            "the CLAP models are not installed"
+            "the CLAP models are not installed (the optional `models` extra)"
         notes.append(f"keyword-only search: {why}")
         return "keyword"
     if resolved.model_key not in models:

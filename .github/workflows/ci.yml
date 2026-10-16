@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The default install: no `models` extra, so no torch. The default pytest markers
+    # deselect the tests that need real model weights (models) or a real library (nas).
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --locked
+
+      - run: uv run ruff check src tests
+
+      - run: uv run pytest -q
+
+  models:
+    # The `models` extra with CPU-only torch (the lock pins CUDA wheels on Linux, which
+    # are several GB): runs the suite again, including the tests that build CNN14 on
+    # random weights. No pretrained weights are downloaded.
+    name: test (ubuntu-latest, models extra, CPU torch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          cache-suffix: models-cpu
+
+      - run: uv sync --locked
+
+      - name: Add the models extra with CPU torch (versions from uv.lock)
+        run: |
+          uv export --locked --extra models --no-dev --no-emit-project --no-hashes \
+            --no-header --no-annotate > models.txt
+          grep -v -E '^(torch|nvidia-|triton)' models.txt > models-cpu.txt
+          torch_pin=$(grep -o -E '^torch==[0-9.]+' models.txt | head -n 1)
+          uv pip install -r models-cpu.txt
+          uv pip install --no-deps "$torch_pin" --index-url https://download.pytorch.org/whl/cpu
+          uv run --no-sync python -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+
+      - run: uv run --no-sync pytest -q

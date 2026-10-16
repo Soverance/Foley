@@ -182,7 +182,11 @@ def test_set_factory_clears_cached_encoders(fake_models):
 
 def test_resolve_device():
     assert models.resolve_device("cpu") == "cpu"
-    assert models.resolve_device("auto") in ("cpu", "cuda")
+    if "torch" in models.missing_packages():
+        with pytest.raises(ModelUnavailable, match="torch"):
+            models.resolve_device("auto")
+    else:
+        assert models.resolve_device("auto") in ("cpu", "cuda")
 
 
 # --------------------------------------------------------------------------- config

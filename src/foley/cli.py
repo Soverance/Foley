@@ -109,7 +109,11 @@ def cmd_eval(cfg, args) -> int:
             print(f"foley: {e}", file=sys.stderr)
             return 2
         path = evaluate.write_report(cfg, report)
-        adopted = evaluate.adopt(conn, report) if args.adopt else None
+        try:
+            adopted = evaluate.adopt(conn, report) if args.adopt else None
+        except evaluate.EvalError as e:
+            print(f"foley: {e}", file=sys.stderr)
+            return 2
     finally:
         conn.close()
     if args.json:

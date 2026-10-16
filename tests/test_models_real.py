@@ -15,7 +15,11 @@ from foley import models
 from foley.decode import DecodedAudio
 from foley.models import clap, panns, prep
 
-pytestmark = pytest.mark.models
+pytestmark = [
+    pytest.mark.models,
+    pytest.mark.skipif(bool(models.missing_packages()),
+                       reason="needs the optional `models` extra (torch, transformers)"),
+]
 
 
 @pytest.fixture(scope="module")

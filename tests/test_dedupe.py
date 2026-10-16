@@ -16,7 +16,7 @@ def _add(conn, rel, content_hash, size=1000, status="active", first_seen="2026-0
 def _decision(conn, content_hash, rel):
     conn.execute(
         "INSERT INTO ledger.decisions(content_hash, rel_path, project, usage_key, verdict, "
-        "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.x', 'approved', 'scott', 'now')",
+        "decided_by, decided_at) VALUES (?, ?, 'game', 'sfx.x', 'approved', 'reviewer', 'now')",
         (content_hash, rel),
     )
 

@@ -56,11 +56,11 @@ def measure_file(path):
 def test_load_project_config(project):
     assert importer.load_project_config(project) == {}
     (project / "foley.project.toml").write_text(
-        '[project]\nname = "endless-reach"\n[loudness]\noneshot_peak_db = -3.0\n'
+        '[project]\nname = "my-game"\n[loudness]\noneshot_peak_db = -3.0\n'
         '[loudness.targets]\n"sfx.ui" = -20.0\n"music" = -16.0\n[review]\nhero_slots = ["music.title"]\n'  # noqa: E501
     )
     cfg = importer.load_project_config(project)
-    assert cfg["project"]["name"] == "endless-reach"
+    assert cfg["project"]["name"] == "my-game"
     assert importer.target_for_usage(cfg, "sfx.ui.click") == -20.0
     assert importer.target_for_usage(cfg, "music") == -16.0
     assert importer.target_for_usage(cfg, "sfx.weapon") is None
@@ -124,14 +124,14 @@ def test_cap_at_minus_one_dbtp(cfg, conn, project):
 
 def test_short_clip_uses_peak_rule(cfg, conn, project):
     (project / "foley.project.toml").write_text(
-        '[project]\nname = "endless-reach"\n[loudness]\noneshot_peak_db = -6.0\n'
+        '[project]\nname = "my-game"\n[loudness]\noneshot_peak_db = -6.0\n'
     )
     aid = asset(conn, SHORT)
     out = importer.import_to_project(cfg, conn, aid, project, "res://click.wav", target_lufs=-20.0)
     assert out["gain_applied"] is True
     assert out["normalized_to_lufs"] is None
     assert measure_file(project / "click.wav")["true_peak_db"] == pytest.approx(-6.0, abs=0.1)
-    assert usage_rows(conn)[0]["project"] == "endless-reach"
+    assert usage_rows(conn)[0]["project"] == "my-game"
 
 
 def test_lossy_copied_unmodified_with_gain_recorded(cfg, conn, project):

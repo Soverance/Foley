@@ -42,11 +42,11 @@ def test_status_after_index(indexed, library):
     ).fetchone()[0]
     conn.execute(
         "INSERT INTO ledger.usages(content_hash, rel_path, project, project_path, imported_at) "
-        "VALUES (?, 'sfx/click.wav', 'endless', 'res://click.wav', 'now')", (usage_hash,)
+        "VALUES (?, 'sfx/click.wav', 'my-game', 'res://click.wav', 'now')", (usage_hash,)
     )
     conn.execute(
         "INSERT INTO ledger.usages(content_hash, rel_path, project, project_path, imported_at) "
-        "VALUES ('nohash', 'sfx/gone_long_ago.wav', 'endless', 'res://x.wav', 'now')"
+        "VALUES ('nohash', 'sfx/gone_long_ago.wav', 'my-game', 'res://x.wav', 'now')"
     )
     db.set_meta(conn, "models", json.dumps({"clap": "laion/clap-htsat-unfused"}))
     conn.close()
@@ -73,12 +73,12 @@ def test_status_after_index(indexed, library):
     assert st["duplicates"]["exact_groups"] == 1 and st["duplicates"]["reclaimable_bytes"] > 0
     assert st["duplicates"]["audio_identical_groups"] == 0
     assert st["used_but_missing"] == [
-        {"rel_path": "sfx/click.wav", "project": "endless"},
-        {"rel_path": "sfx/gone_long_ago.wav", "project": "endless"},
+        {"rel_path": "sfx/click.wav", "project": "my-game"},
+        {"rel_path": "sfx/gone_long_ago.wav", "project": "my-game"},
     ]
     # provenance from meta: entries written by others are kept next to the indexer's
     assert st["models"]["provenance"]["clap"] == "laion/clap-htsat-unfused"
-    assert set(st["models"]) == {"tags", "embeddings", "provenance"}
+    assert set(st["models"]) == {"installed", "note", "tags", "embeddings", "provenance"}
     assert st["errors"] == [{"rel_path": "sfx/broken.wav", "error": st["errors"][0]["error"]}]
     assert st["error_count"] == 1
     assert status.staleness_note(conn) is None

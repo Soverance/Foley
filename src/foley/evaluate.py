@@ -28,6 +28,9 @@ CONTRACT:
            recommendation: {clap_model, blend_weight, reason}}
         Warnings name good paths that are not active assets (not in the catalog,
         missing, error, pending), noting when an active exact copy still lets it pass.
+        Without CLAP (vectors.clap_api() None: the optional `models` extra is not
+        installed) only keyword-only is measured; a warning and the recommendation's
+        reason say so.
         Read-only on the catalog.
     format_report(report) -> str               compact table, best config, its misses
     write_report(cfg, report) -> Path          data_dir/eval/<UTC timestamp>.json
@@ -35,7 +38,9 @@ CONTRACT:
         search_blend_weight and search_eval (JSON summary); CLAP is kept only if the
         best hybrid config beats keyword-only on (recall, MRR), else weight 0 is
         adopted (the checkpoint that did best is still recorded). Returns
-        {clap_model, blend_weight, reason}.
+        {clap_model, blend_weight, reason}. Raises EvalError, writing nothing, when no
+        CLAP configuration was measured (models extra missing or no embeddings yet), so
+        a machine that cannot compare never overwrites a tuned setting.
 
 DESIGN NOTES:
 
@@ -118,6 +123,9 @@ def _parse_weights(weights) -> list[float]:
 
 def _models(conn: sqlite3.Connection, clap, warnings: list[str]) -> dict:
     present = vectors.embedding_models(conn)
+    if vectors.clap_api() is None:
+        warnings.append("CLAP is not installed (the optional `models` extra), so only "
+                        "keyword-only search is measured")
     names = list(clap) if clap else vectors.checkpoints()
     models = {}
     for name in names:
@@ -230,8 +238,9 @@ def run(cfg, conn: sqlite3.Connection, testset_path=None, clap=None, weights=Non
                "reason": "no hybrid config beats keyword-only, so search stays keyword-only "
                          f"(blend weight 0); best checkpoint was {hybrid_best['clap_model']}"}
     else:
-        rec = {"clap_model": None, "blend_weight": 0.0,
-               "reason": "no CLAP embeddings to compare: keyword-only"}
+        why = ("CLAP is not installed" if vectors.clap_api() is None
+               else "no CLAP embeddings to compare")
+        rec = {"clap_model": None, "blend_weight": 0.0, "reason": f"{why}: keyword-only"}
 
     def summary(c):
         return None if c is None else {k2: c[k2] for k2 in
@@ -344,6 +353,9 @@ def write_report(cfg, report: dict) -> Path:
 
 
 def adopt(conn: sqlite3.Connection, report: dict) -> dict:
+    if not report.get("hybrid_best"):
+        raise EvalError("nothing to adopt: no CLAP configuration was measured "
+                        f"({report['recommendation']['reason']}); meta left unchanged")
     rec = report["recommendation"]
     best = report.get("hybrid_best") or report.get("keyword")
     summary = {

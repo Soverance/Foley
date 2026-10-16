@@ -74,7 +74,17 @@ class FakeTextEncoder:
         return out
 
 
-class FakeFactory(ModelFactory):
+class _NoTorchFactory(ModelFactory):
+    """Fakes run without torch: always "installed", and "auto" means the CPU."""
+
+    def unavailable(self):
+        return None
+
+    def resolve_device(self, device):
+        return "cpu" if device in ("auto", "cuda") else device
+
+
+class FakeFactory(_NoTorchFactory):
     def __init__(self, fail: set[str] | None = None):
         self.calls: list = []
         self.loads: list = []
@@ -98,7 +108,7 @@ class FakeFactory(ModelFactory):
         return FakeTextEncoder(short_name)
 
 
-class UnavailableFactory(ModelFactory):
+class UnavailableFactory(_NoTorchFactory):
     """The default in tests: like a machine whose weights cannot be fetched, so the model
     stages are skipped (with a note) unless a test installs FakeFactory."""
 

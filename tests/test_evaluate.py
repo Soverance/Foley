@@ -6,7 +6,7 @@ import _fake_clap as fc
 import pytest
 from _catalog_builder import add_asset
 
-from foley import cli, evaluate, search, status
+from foley import cli, evaluate, search, status, vectors
 from foley.catalog import db
 
 
@@ -196,3 +196,23 @@ def test_cli_eval(cfg, conn, testset_path, tmp_path, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["queries_answered"] == 5 and data["adopted"] is None
     assert cli.main(["--config", str(toml), "eval", "--weights", "x"]) == 2
+
+
+def test_without_clap_installed(cfg, conn, testset_path, monkeypatch):
+    monkeypatch.setattr(vectors, "clap_api", lambda: None)  # no `models` extra
+    report = evaluate.run(cfg, conn, testset_path, weights=[0, 0.5])
+    assert [c["name"] for c in report["configs"]] == ["keyword only"]
+    assert any("CLAP is not installed" in w for w in report["warnings"])
+    assert report["recommendation"] == {"clap_model": None, "blend_weight": 0.0,
+                                        "reason": "CLAP is not installed: keyword-only"}
+
+
+def test_adopt_refuses_without_a_clap_comparison(cfg, conn, testset_path, monkeypatch):
+    db.set_meta(conn, "search_clap_model", "fake-b")
+    db.set_meta(conn, "search_blend_weight", "0.3")
+    monkeypatch.setattr(vectors, "clap_api", lambda: None)  # a machine without the extra
+    report = evaluate.run(cfg, conn, testset_path, weights=[0, 0.5])
+    with pytest.raises(evaluate.EvalError, match="nothing to adopt"):
+        evaluate.adopt(conn, report)
+    assert db.get_meta(conn, "search_clap_model") == "fake-b"  # tuned values untouched
+    assert db.get_meta(conn, "search_blend_weight") == "0.3"

@@ -26,7 +26,23 @@ import soundfile as sf
 from foley import dedupe, status, sync
 from foley.catalog import db
 
-_STATE: dict = {"armed": False, "root": None, "root_text": None, "violations": []}
+_STATE: dict = {"armed": False, "root": None, "root_text": None, "violations": [],
+                 "fold": False}
+
+
+def _fold(text: str) -> str:
+    """normcase, plus case folding where the library's filesystem ignores case (Windows;
+    usually macOS too, where normcase does not fold)."""
+    text = os.path.normcase(text)
+    return text.lower() if _STATE["fold"] else text
+
+
+def _case_insensitive(path: Path) -> bool:
+    other = Path(str(path).swapcase())
+    try:
+        return str(other) != str(path) and other.exists() and os.path.samefile(other, path)
+    except OSError:
+        return False
 _INSTALLED = False
 _LOCAL = threading.local()
 _REAL_SOUNDFILE = sf.SoundFile
@@ -80,7 +96,7 @@ def _normalize(path) -> str | None:
         if text[: len(prefix)].upper() == prefix.upper():
             text = repl + text[len(prefix):]
             break
-    return os.path.normcase(os.path.realpath(text))
+    return _fold(os.path.realpath(text))
 
 
 def _under_root(path) -> bool:
@@ -91,7 +107,7 @@ def _under_root(path) -> bool:
 
 def _mentions_root(text) -> bool:
     try:
-        s = os.path.normcase(os.fsdecode(text))
+        s = _fold(os.fsdecode(text))
     except (TypeError, ValueError):
         return False
     return _STATE["root_text"] is not None and _STATE["root_text"] in s or _under_root(text)
@@ -192,8 +208,9 @@ def _arm(library: Path) -> None:
     if not _INSTALLED:
         sys.addaudithook(_hook)
         _INSTALLED = True
-    root = os.path.normcase(os.path.realpath(library))
-    _STATE.update(root=root, root_text=os.path.normcase(str(library)), violations=[], armed=True)
+    _STATE["fold"] = _case_insensitive(Path(library))
+    root = _fold(os.path.realpath(library))
+    _STATE.update(root=root, root_text=_fold(str(library)), violations=[], armed=True)
 
 
 def _worker_guard() -> None:
@@ -275,7 +292,6 @@ def test_hook_catches_library_writes(guard, library, tmp_path):
         lambda: open(target, "r+b"),
         lambda: open(library / "new.txt", "w"),
         lambda: open("\\\\?\\" + str(target), "ab"),
-        lambda: open(str(target).upper(), "ab"),
         lambda: os.open(target, os.O_WRONLY),
         lambda: os.remove(target),
         lambda: os.rename(target, library / "moved.wav"),
@@ -292,6 +308,8 @@ def test_hook_catches_library_writes(guard, library, tmp_path):
                                 str(library / "out.wav")]),
         lambda: subprocess.run([sys.executable, "-c", "pass"], cwd=library),
     ]
+    if guard["fold"]:  # the same file under another case (Windows, usually macOS)
+        attempts.append(lambda: open(str(target).upper(), "ab"))
     if hasattr(os, "O_TEMPORARY"):
         attempts.append(lambda: os.open(target, os.O_RDONLY | os.O_TEMPORARY))
     for attempt in attempts:
