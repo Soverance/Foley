@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 
 import audiogen as ag
@@ -198,7 +199,11 @@ def test_fixture_library_end_to_end(library):
 
 
 def test_typical_file_is_fast(capsys):
-    """3 s 48 kHz stereo: decode + features + loudness, warm, well under 0.3 s."""
+    """3 s 48 kHz stereo: decode + features + loudness, warm, well under 0.3 s.
+
+    Shared CI runners are several times slower and noisy, so under CI (the `CI`
+    environment variable, set by GitHub Actions) the budget only catches
+    pathological regressions."""
     import io
 
     import soundfile as sf
@@ -216,9 +221,10 @@ def test_typical_file_is_fast(capsys):
         decode.audio_hash(audio)
         return time.perf_counter() - t
 
+    budget = 2.0 if os.environ.get("CI") else 0.3
     for kind in ("sfx", "music"):
         run(kind)  # warm-up: librosa lazy imports and numba compilation
         best = min(run(kind) for _ in range(3))
         with capsys.disabled():
             print(f"\n3 s stereo 48 kHz, {kind}: {best * 1000:.1f} ms")
-        assert best < 0.3
+        assert best < budget
