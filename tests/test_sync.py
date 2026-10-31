@@ -471,6 +471,35 @@ def test_settling_files_are_skipped_until_settled(cfg, library, fakes):
     assert (s.settling, s.added, s.changed) == (0, 1, 1)
 
 
+def test_future_dated_files_are_indexed_not_held(cfg, library, fakes):
+    # zip entries carry zone-less local time, so a pack zipped east of here extracts
+    # hours in the future; only clock skew within the settle window is held back
+    sync.run_index(cfg)
+    ahead = library / "sfx/zipped_in_tokyo.wav"
+    skew = library / "sfx/nas_clock_ahead.wav"
+    ag.write(ahead, ag.tone(500, 0.3))
+    ag.write(skew, ag.tone(600, 0.3))
+    later = time.time() + 13 * 3600
+    os.utime(ahead, (later, later))
+    os.utime(skew, (time.time() + 60, time.time() + 60))
+    lines: list[str] = []
+    s = sync.run_index(cfg, progress=lines.append)
+    assert (s.settling, s.added) == (1, 1)
+    assert _asset(cfg, "sfx/zipped_in_tokyo.wav")["status"] == "active"
+    assert _asset(cfg, "sfx/nas_clock_ahead.wav") is None
+    listed = [ln for ln in lines if "nas_clock_ahead.wav" in ln]
+    assert len(listed) == 1 and "in the future" in listed[0]
+
+
+def test_settling_files_are_listed_in_the_log(cfg, library, fakes):
+    sync.run_index(cfg)
+    ag.write(library / "sfx/fresh.wav", ag.tone(500, 0.3))
+    lines: list[str] = []
+    sync.run_index(cfg, progress=lines.append)
+    listed = [ln for ln in lines if "sfx/fresh.wav" in ln]
+    assert len(listed) == 1 and "ago" in listed[0] and "ready in" in listed[0]
+
+
 def test_settle_window_is_configurable(cfg, library, fakes):
     cfg.settle_minutes = 0
     ag.write(library / "sfx/fresh.wav", ag.tone(500, 0.3))

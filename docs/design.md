@@ -77,7 +77,7 @@ Nothing in Foley writes to the library, with one planned exception: duplicate cl
 | Size or modification time changed | Re-analyse it, keeping the same asset id |
 | Path gone | Mark it `missing` and keep the row, so decisions and usages stay valid |
 | Moved or renamed | Re-point the existing asset to the new path, keeping its analysis and decisions. Matched cheaply by name, size and time when unambiguous, otherwise by content hash |
-| Still being written (modified within `settle_minutes`) | Skip it until a later run; packs are often extracted in bulk |
+| Still being written (modified within `settle_minutes`, either side of now to absorb clock skew) | Skip it until a later run, listing it by name in the log; packs are often extracted in bulk. A modified time further in the future is the file's own date (zip entries store zone-less local time), so it is indexed, not held |
 | Archive (`.zip`, `.rar`, `.7z`) | Don't index it; report it under "archives not extracted" |
 | Decode failure | Mark it `error` with the reason, and retry on later runs |
 
