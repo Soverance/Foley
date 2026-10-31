@@ -11,8 +11,10 @@ CONTRACT:
         "http://<host>:<port>/" and `server.app` the BrowseApp holding the caches, the
         shortlist and `scans`: the given scans.ScanScheduler, else a new one (not started).
     serve(cfg, host=None, port=None, open_browser=True, out=None, verbose=False,
-          schedule=True) -> None
-        make_server + serve_forever until Ctrl+C. Reports through the "foley.browse"
+          schedule=True, stop_on_eof=False) -> None
+        make_server + serve_forever until Ctrl+C, or, with `stop_on_eof`, until standard
+        input reaches end of file (how `foley tray` stops its child cleanly: it closes
+        the pipe; ignored with a warning when there is no stdin). Reports through the "foley.browse"
         logger (and `out(line)` too when given): the URL; for a non-loopback bind a
         one-line notice when [browse] allowed_hosts is set, else a loud WARNING. With
         `schedule`, starts the scan scheduler (scans.ScanScheduler.start) and on exit
@@ -1841,9 +1843,29 @@ def make_server(cfg: Config, host: str | None = None, port: int | None = None,
     return BrowseServer(cfg, host, port, verbose=verbose, scans=scans)
 
 
+def _stop_on_stdin_eof(server: BrowseServer, say) -> None:
+    """Shut `server` down once stdin reaches end of file (the parent closed the pipe)."""
+    stream = sys.stdin
+    if stream is None:  # pythonw.exe without redirected handles
+        say("foley browse: --stop-on-stdin-eof ignored: there is no standard input",
+            logging.WARNING)
+        return
+
+    def watch() -> None:
+        try:
+            while stream.buffer.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
+        say("foley browse: stopping (standard input closed)")
+        server.shutdown()
+
+    threading.Thread(target=watch, name="foley-browse-stdin", daemon=True).start()
+
+
 def serve(cfg: Config, host: str | None = None, port: int | None = None,
           open_browser: bool = True, out=None, verbose: bool = False,
-          schedule: bool = True) -> None:
+          schedule: bool = True, stop_on_eof: bool = False) -> None:
     def say(line: str, level: int = logging.INFO) -> None:
         log.log(level, line)
         if out is not None:
@@ -1884,6 +1906,8 @@ def serve(cfg: Config, host: str | None = None, port: int | None = None,
         import webbrowser
 
         threading.Timer(0.3, webbrowser.open, args=(url,)).start()
+    if stop_on_eof:
+        _stop_on_stdin_eof(server, say)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

@@ -164,7 +164,7 @@ The removal commands (`plan`, `apply`, `restore`, `purge`) are designed but **no
 
 ## The browser
 
-`foley browse` is a stdlib HTTP server with a static, dependency-free UI: no build step, no CDN, fonts bundled, so it works offline. It reads the catalog, streams audio from the library read-only (with HTTP range requests for seeking), renders peaks and overview images on demand, and writes only caches, the shortlist, the scan schedule and the configured test set. It listens on loopback by default. On a LAN it answers only configured host names, which blocks DNS rebinding, and it has no authentication. Serve it only to people licensed to use the library, because sample licences usually forbid wider access. See [browse.md](browse.md).
+`foley browse` is a stdlib HTTP server with a static, dependency-free UI: no build step, no CDN, fonts bundled, so it works offline. It reads the catalog, streams audio from the library read-only (with HTTP range requests for seeking), renders peaks and overview images on demand, and writes only caches, the shortlist, the scan schedule and the configured test set. `foley tray` runs it as a child process behind a notification-area icon, so a person can restart it to load new code, stop it, or start a scan without a terminal. The tray stops the server by closing its stdin, so a running scan is stopped cleanly rather than killed. It listens on loopback by default. On a LAN it answers only configured host names, which blocks DNS rebinding, and it has no authentication. Serve it only to people licensed to use the library, because sample licences usually forbid wider access. See [browse.md](browse.md).
 
 ## Roadmap
 

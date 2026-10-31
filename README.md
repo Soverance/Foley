@@ -174,7 +174,7 @@ Next:
 - [docs/mcp-tools.md](docs/mcp-tools.md): the MCP tools, their inputs and results
 - [docs/browse.md](docs/browse.md): the browser, shortcuts, test-set mode, scans, LAN serving, branding
 - [docs/eval.md](docs/eval.md): writing a search test set and reading `foley eval`
-- [docs/deploy-windows.md](docs/deploy-windows.md): always-on browser with a logon task and firewall rule
+- [docs/deploy-windows.md](docs/deploy-windows.md): always-on browser with a tray icon, a logon task and a firewall rule
 - [docs/design.md](docs/design.md): how Foley works and why
 - [docs/schema.md](docs/schema.md): the SQLite contract
 

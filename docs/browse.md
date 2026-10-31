@@ -102,7 +102,7 @@ Before you do this, mind two things:
 - **Licences.** Sample libraries are usually licensed to named users or seats. Streaming a library to everyone on a network can breach that. Serve it only to people licensed to use it.
 - **No authentication.** Anyone who can reach the port can browse and download every audio file in the library, read the catalog, edit the shortlist and test set, and start or stop scans. It is meant for a trusted studio LAN behind a firewall, never the internet. Use a firewall rule limited to your subnet.
 
-[deploy-windows.md](deploy-windows.md) sets this up as an always-on Windows service with a logon task and a firewall rule.
+[deploy-windows.md](deploy-windows.md) sets this up to run always-on from a tray icon, with a logon task and a firewall rule.
 
 ## Branding
 

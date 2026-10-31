@@ -3,10 +3,12 @@
     Start `foley browse` in the background every time you log on to Windows.
 
 .DESCRIPTION
-    Registers a Task Scheduler task for the current user that runs the browse server
-    with the repo's own interpreter (pythonw.exe, so no console window) at logon. The
-    task runs under your normal logon, so it reaches a NAS share with your own
-    credentials: no stored password and no admin rights needed.
+    Registers a Task Scheduler task for the current user that runs `foley tray` with
+    the repo's own interpreter (pythonw.exe, so no console window) at logon. The tray
+    icon runs the browse server and has a right-click menu to open, restart or stop it
+    and to start a scan. With -Headless the task runs `foley browse` directly, with no
+    icon. The task runs under your normal logon, so it reaches a NAS share with your
+    own credentials: no stored password and no admin rights needed.
 
     Host, port and allowed host names come from the [browse] table of foley.toml, and
     the daily library scan from [schedule] (or the Scans dialog in the UI).
@@ -16,6 +18,7 @@
 
 .EXAMPLE
     .\scripts\windows\install-browse-task.ps1              # install (or update) and start now
+    .\scripts\windows\install-browse-task.ps1 -Headless    # no tray icon
     .\scripts\windows\install-browse-task.ps1 -Uninstall   # stop and remove
 #>
 [CmdletBinding()]
@@ -26,6 +29,7 @@ param(
     # Explicit foley.toml; by default the server uses its normal lookup
     # (FOLEY_CONFIG, then <data dir>\foley.toml).
     [string]$Config,
+    [switch]$Headless,
     [switch]$NoStart,
     [switch]$Uninstall
 )
@@ -51,7 +55,11 @@ New-Item -ItemType Directory -Force (Split-Path $LogFile) | Out-Null
 
 $arguments = @('-m', 'foley.cli')
 if ($Config) { $arguments += @('--config', "`"$((Resolve-Path $Config).Path)`"") }
-$arguments += @('browse', '--no-open', '--log-file', "`"$LogFile`"")
+if ($Headless) {
+    $arguments += @('browse', '--no-open', '--log-file', "`"$LogFile`"")
+} else {
+    $arguments += @('tray', '--log-file', "`"$LogFile`"")
+}
 
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument ($arguments -join ' ') `
@@ -66,7 +74,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force `
-    -Description "Foley library browser (foley browse) from $repo. Log: $LogFile" | Out-Null
+    -Description "Foley library browser ($(if ($Headless) { 'foley browse' } else { 'foley tray' })) from $repo. Log: $LogFile" | Out-Null
 Write-Host "Registered task '$TaskName' (at logon of $user)."
 
 if (-not $NoStart) {

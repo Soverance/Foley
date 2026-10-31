@@ -40,6 +40,8 @@ dependencies = [
     "pillow>=10.0",
     "matplotlib>=3.8",
     "mcp>=2.3",
+    # `foley tray` (system-tray icon); on other platforms install it yourself.
+    "pystray>=0.19.5; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

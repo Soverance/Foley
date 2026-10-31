@@ -217,7 +217,7 @@ def cmd_browse(cfg, args) -> int:
     port = args.port if args.port is not None else cfg.browse_port
     try:
         browse.serve(cfg, host=host, port=port, open_browser=not args.no_open,
-                     verbose=args.verbose)
+                     verbose=args.verbose, stop_on_eof=args.stop_on_stdin_eof)
     except OSError as e:  # port in use, address not available, ...
         # Logged, not printed: under pythonw.exe there is no stderr (configure_logging
         # sends it to the console when there is one, and to --log-file).
@@ -229,6 +229,12 @@ def cmd_browse(cfg, args) -> int:
         logging.getLogger("foley.browse").exception("foley browse crashed")
         raise
     return 0
+
+
+def cmd_tray(cfg, args) -> int:
+    from foley import tray
+
+    return tray.run(cfg, log_file=args.log_file)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -314,7 +320,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--verbose", action="store_true", help="log every request")
     s.add_argument("--log-file", metavar="PATH",
                    help="also log server and scan events to this size-rotated file")
+    s.add_argument("--stop-on-stdin-eof", action="store_true",
+                   help="stop cleanly when standard input closes (used by foley tray)")
     s.set_defaults(func=cmd_browse)
+
+    s = sub.add_parser("tray", help="run foley browse from a system-tray icon (Windows)")
+    s.add_argument("--log-file", metavar="PATH",
+                   help="the server's log (default <data dir>/logs/browse.log); the tray "
+                   "logs to tray.log beside it")
+    s.set_defaults(func=cmd_tray)
     return p
 
 
@@ -326,13 +340,18 @@ def main(argv: list[str] | None = None) -> int:
         from foley import browse
 
         browse.configure_logging(args.log_file)
+    elif args.command == "tray":
+        # Same reason; the tray must not import browse (numpy), so it has its own.
+        from foley import tray
+
+        tray.configure_logging(tray.tray_log_path(args.log_file))
     try:
         cfg = config_mod.load(args.config)
     except config_mod.ConfigError as e:
-        if args.command == "browse":
+        if args.command in ("browse", "tray"):
             import logging
 
-            logging.getLogger("foley.browse").error("foley: %s", e)
+            logging.getLogger(f"foley.{args.command}").error("foley: %s", e)
         else:
             print(f"foley: {e}", file=sys.stderr)
         return 2
