@@ -143,6 +143,7 @@ MODEL_BATCH_FILES = 16
 _PATH_STAGES = ("metadata", "caption", "fts")
 _AUDIO_STAGES = ("features", "loudness")
 _PROGRESS_EVERY = 50
+_SETTLING_SHOWN = 50  # settling files listed by name in the scan log
 
 # Files above this size are hashed by streaming and decoded with decode.decode_path, so
 # their raw bytes and decoded audio are never in memory together (a second read is fine
@@ -613,18 +614,24 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
     now = db.utcnow()
     now_ns = time.time_ns()
     settle_ns = int(cfg.settle_minutes * 60 * 1e9)
-    day_ns = 86_400 * 10**9
 
     def settling(f: scan.ScannedFile) -> bool:
-        age = now_ns - f.mtime_ns
-        return (0 <= age < settle_ns) or (-day_ns < age < 0)
+        # A file still being written carries a modified time of about now (the share's
+        # clock), so the window runs both ways to absorb clock skew. A time further in
+        # the future is a file's own date, not a write in progress: zip entries store
+        # local time with no zone, so a pack zipped east of here extracts hours ahead.
+        # Waiting for such a file would hold it back for hours; index it now, and a
+        # later rewrite is still caught by the size/mtime diff.
+        return abs(now_ns - f.mtime_ns) < settle_ns
 
     present = {f.rel_path for f in result.audio}
     new_files, changed, reappeared, seen_ids = [], [], [], []
+    settling_files: list[scan.ScannedFile] = []
     for f in result.audio:
         row = by_path.get(f.rel_path)
         if settling(f):
             summary.settling += 1
+            settling_files.append(f)
             if row is not None:
                 seen_ids.append(row["id"])
             continue
@@ -769,7 +776,24 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
         + f"{summary.missing} missing, {summary.settling} settling, "
         f"{summary.archives} archives; {len(work)} to analyze"
     )
+    _say_settling(prog, settling_files, now_ns, settle_ns)
     return work, result.errors, gone_ids
+
+
+def _say_settling(prog, files: list[scan.ScannedFile], now_ns: int, settle_ns: int) -> None:
+    """Log which files the settle window held back and when each will be picked up."""
+    if not files:
+        return
+    files = sorted(files, key=lambda f: f.rel_path)
+    prog.say(f"settling (modified within {settle_ns / 6e10:g} min, skipped until a later run):")
+    for f in files[:_SETTLING_SHOWN]:
+        age_s = (now_ns - f.mtime_ns) / 1e9
+        wait_min = max(0.0, (f.mtime_ns + settle_ns - now_ns) / 6e10)
+        when = (f"modified {age_s:.0f}s ago" if age_s >= 0
+                else f"modified time is {-age_s:.0f}s in the future")
+        prog.say(f"  {f.rel_path}  ({when}; ready in {wait_min:.1f} min)")
+    if len(files) > _SETTLING_SHOWN:
+        prog.say(f"  ... and {len(files) - _SETTLING_SHOWN} more")
 
 
 def _match_renames(old_rows, new_files) -> list:

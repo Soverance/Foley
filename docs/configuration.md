@@ -21,7 +21,7 @@ Paths can use forward slashes on Windows (`C:/Users/me/...`). A bad value stops 
 | --- | --- | --- |
 | `root` | (required) | Root of the audio library. A UNC path (`//nas.example.local/Audio`), a mapped drive or a local folder. Every catalog path is stored relative to it, so a UNC path and a drive letter for the same share are interchangeable. Foley only reads from here. |
 | `pack_roots` | `["packs"]` | Folders directly under the root whose children are packs. For `packs/<pack>/<a>/<b>/file.wav`, the pack is `<pack>` and the category path `<a>/<b>`. Outside a pack root the pack is empty and the category path is the whole folder. Search can filter on both. |
-| `settle_minutes` | `10` | Files modified more recently than this are skipped until a later run, since they may still be copying or extracting. |
+| `settle_minutes` | `10` | Files modified more recently than this (or dated less than this in the future, for clock skew) are skipped until a later run, since they may still be copying or extracting. The scan log lists them by name. |
 
 Audio extensions indexed: `.wav .flac .ogg .mp3 .aif .aiff`. Archives (`.zip .rar .7z`) are counted, never opened: `foley status` lists the ones without an extracted folder next to them.
 
