@@ -75,7 +75,9 @@ Then register the MCP server with Claude Code, in your game repo's `.mcp.json`:
 }
 ```
 
-If `foley.toml` is not in the current directory or the default data folder, add `"env": {"FOLEY_CONFIG": "C:/path/to/foley.toml"}`. [docs/mcp-tools.md](docs/mcp-tools.md) has the details.
+If `foley.toml` is not in the current directory or the default data folder, add `"env": {"FOLEY_CONFIG": "C:/path/to/foley.toml"}`.
+
+If a machine runs `foley browse` permanently, set `[mcp] enabled = true` and point every session at its `/mcp` endpoint instead: all sessions share that one server and none starts a process of its own. [docs/mcp-tools.md](docs/mcp-tools.md#registering-the-server) has both setups.
 
 ## How Claude Code uses it
 

@@ -1,6 +1,6 @@
 # MCP tools
 
-`foley-mcp` is an [MCP](https://modelcontextprotocol.io/) server over stdio. It gives Claude Code (or any MCP client) seven tools over the catalog. Results are compact JSON: ids, library-relative paths, a one-line caption, the top tags and a few key numbers, never raw feature arrays, so a search costs few tokens.
+Foley gives Claude Code (or any MCP client) seven [MCP](https://modelcontextprotocol.io/) tools over the catalog, served either by the shared endpoint of a running `foley browse` or by `foley-mcp` over stdio. Results are compact JSON: ids, library-relative paths, a one-line caption, the top tags and a few key numbers, never raw feature arrays, so a search costs few tokens.
 
 **No tool modifies the audio library.** `import_to_project` writes only into the game project you name.
 
@@ -8,7 +8,39 @@ Units everywhere: durations in seconds, loudness in integrated LUFS, peaks in dB
 
 ## Registering the server
 
-In the game repo's `.mcp.json` (project scope), or with `claude mcp add` at user scope:
+There are two ways to connect. Both serve the same tools.
+
+### The shared endpoint (recommended with an always-on `foley browse`)
+
+A running `foley browse` serves the tools at `/mcp` when `foley.toml` has:
+
+```toml
+[mcp]
+enabled = true
+project_roots = ["C:/Projects"]   # where import_to_project may write
+```
+
+Every Claude Code session then connects to that one server and starts no process of its own. In the game repo's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "foley": {
+      "type": "http",
+      "url": "http://foley.example.lan/mcp",
+      "headers": { "Authorization": "Bearer ${FOLEY_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+- **Token.** When the server listens on a network address, every request needs the token. Run `foley mcp token` on the server machine to print it (it is created on first use, in the data folder as `mcp_token`), and set it as the `FOLEY_MCP_TOKEN` environment variable for each person who uses Claude Code. Claude Code expands `${FOLEY_MCP_TOKEN}` when it reads `.mcp.json`, so the token never goes into the repo. A server bound to loopback only needs no token.
+- **Imports.** Through the shared endpoint, the server writes the imported file on its own disk, so `import_to_project` accepts only a `project_root` inside one of `[mcp] project_roots`. Anything else is refused with a message naming that setting.
+- **When the server is down**, Foley's tools are unavailable to every session until it is back. Reconnect from Claude Code's `/mcp` menu.
+
+### `foley-mcp` over stdio
+
+For a machine with a catalog but no running server. Claude Code starts one `foley-mcp` process per session:
 
 ```json
 {
@@ -21,7 +53,7 @@ In the game repo's `.mcp.json` (project scope), or with `claude mcp add` at user
 }
 ```
 
-`env` is optional when `foley.toml` sits in the default data folder (see [configuration.md](configuration.md#where-foley-looks)). If `foley-mcp` is not on `PATH`, use the full path to the executable in the repo's `.venv\Scripts\` (or `.venv/bin/`).
+`env` is optional when `foley.toml` sits in the default data folder (see [configuration.md](configuration.md#where-foley-looks)). If `foley-mcp` is not on `PATH`, use the full path to the executable in the repo's `.venv\Scripts\` (or `.venv/bin/`). `import_to_project` may write into any project here, since the session's own user runs it on its own machine.
 
 The server sends Claude a short instruction block describing the typical flow and how to read the images, so the tool descriptions below are mostly for you.
 
@@ -29,7 +61,7 @@ The server sends Claude a short instruction block describing the typical flow an
 
 1. `search_audio` with a short description of the sound and technical filters.
 2. `find_similar` on a promising hit to see alternatives that sound alike.
-3. `render_comparison` on the top 4 to 6 candidates, then **Read** the returned PNG (Claude Code's file-reading tool shows it to the model as an image).
+3. `render_comparison` on the top 4 to 6 candidates; the comparison image comes back in the result, so Claude sees it directly.
 4. `import_to_project` with the winner.
 
 `get_shortlist` returns the sounds a person starred while listening in `foley browse`; Claude should check it before searching for something the user may already have picked.
@@ -108,7 +140,7 @@ Render 2 to 6 candidates into one grid PNG.
 | --- | --- | --- |
 | `asset_ids` | int[] | 2 to 6 ids. |
 
-Returns `{"image": "<absolute PNG path>", "assets": [{id, path, duration_s, lufs}]}`. Claude then reads the image.
+Returns two content blocks: the grid as a PNG image, then JSON `{"assets": [{id, path, duration_s, lufs}]}` in grid order. Over stdio the JSON also has `"image"`, the PNG's absolute path on disk, for people.
 
 ![A render_comparison grid of four candidates](images/what-claude-sees.png)
 

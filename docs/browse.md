@@ -104,6 +104,10 @@ Before you do this, mind two things:
 
 [deploy-windows.md](deploy-windows.md) sets this up to run always-on from a tray icon, with a logon task and a firewall rule.
 
+### Claude Code on the same server
+
+With `[mcp] enabled = true`, the same server also answers Claude Code at `/mcp`, so every session on the network shares it instead of starting its own `foley-mcp`. Unlike the web UI, that endpoint needs a token on a network address, because `import_to_project` writes files, and it imports only under `[mcp] project_roots`. Setup is in [mcp-tools.md](mcp-tools.md#registering-the-server).
+
 ## Branding
 
 To show your own logo in the top bar, point `[browse] brand_dir` at a folder holding:

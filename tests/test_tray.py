@@ -266,3 +266,167 @@ def test_browse_stops_cleanly_when_stdin_closes(cfg, tmp_path):
             proc.kill()
             proc.wait()
     assert "stopping (standard input closed)" in log_file.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------- one process per program (Windows)
+
+
+@pytest.fixture
+def venv(tmp_path, monkeypatch):
+    """A fake Windows venv: launchers in venv/Scripts, the real interpreters in base/."""
+    scripts, base = tmp_path / "venv" / "Scripts", tmp_path / "base"
+    for d in (scripts, base):
+        d.mkdir(parents=True)
+        (d / "python.exe").touch()
+        (d / "pythonw.exe").touch()
+    monkeypatch.setattr(tray, "_is_windows", lambda: True)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+    monkeypatch.setattr(sys, "_base_executable", str(base / "python.exe"), raising=False)
+    monkeypatch.setattr(sys, "executable", str(scripts / "pythonw.exe"))
+    monkeypatch.delenv(tray.RELAUNCHED_ENV, raising=False)
+    return scripts, base
+
+
+def test_direct_interpreter_skips_the_venv_launcher(venv):
+    scripts, base = venv
+    assert tray.direct_interpreter(scripts / "python.exe") == (
+        str(base / "python.exe"), str(scripts / "python.exe"))
+    assert tray.direct_interpreter(scripts / "pythonw.exe") == (
+        str(base / "pythonw.exe"), str(scripts / "pythonw.exe"))
+
+
+def test_direct_interpreter_falls_back(venv, monkeypatch, tmp_path):
+    scripts, base = venv
+    exe = str(scripts / "python.exe")
+    (base / "pythonw.exe").unlink()
+    assert tray.direct_interpreter(scripts / "pythonw.exe") == (
+        str(scripts / "pythonw.exe"), None)  # no base interpreter of that name
+    monkeypatch.setattr(sys, "base_prefix", sys.prefix)  # not in a venv
+    assert tray.direct_interpreter(exe) == (exe, None)
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+    monkeypatch.setattr(tray, "_is_windows", lambda: False)
+    assert tray.direct_interpreter(exe) == (exe, None)
+
+
+def test_browse_runs_on_the_base_console_interpreter(venv, tmp_path, monkeypatch):
+    scripts, base = venv
+    monkeypatch.setenv(tray.RELAUNCHED_ENV, "1")
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    assert tray.browse_command(cfg, "b.log")[0] == str(base / "python.exe")
+    env = tray.browse_env()
+    assert env[tray.LAUNCHER_ENV] == str(scripts / "python.exe")
+    assert tray.RELAUNCHED_ENV not in env
+
+
+def test_browse_env_without_a_venv(tmp_path, monkeypatch):
+    monkeypatch.setattr(tray, "_is_windows", lambda: False)
+    monkeypatch.setenv(tray.LAUNCHER_ENV, "stale")
+    assert tray.LAUNCHER_ENV not in tray.browse_env()
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    assert tray.browse_command(cfg, "b.log")[0] == tray._console_python()
+
+
+def test_supervisor_passes_the_environment():
+    seen = []
+
+    def popen(cmd, **kwargs):
+        seen.append(kwargs["env"])
+        return FakeProc()
+
+    tray.Supervisor(["x"], popen=popen, env=lambda: {"A": "1"}).start()
+    tray.Supervisor(["x"], popen=popen).start()
+    assert seen == [{"A": "1"}, None]
+
+
+def test_relaunch_decision(venv, monkeypatch):
+    assert tray.should_relaunch()
+    monkeypatch.setenv(tray.RELAUNCHED_ENV, "1")  # the copy itself
+    assert not tray.should_relaunch()
+    monkeypatch.delenv(tray.RELAUNCHED_ENV)
+    monkeypatch.setattr(sys, "base_prefix", sys.prefix)  # no venv, no launcher
+    assert not tray.should_relaunch()
+    monkeypatch.setattr(sys, "base_prefix", str(venv[1]))
+    monkeypatch.setattr(tray, "_is_windows", lambda: False)
+    assert not tray.should_relaunch()
+
+
+def test_relaunch_starts_a_detached_copy_on_base_pythonw(venv, tmp_path):
+    scripts, base = venv
+    calls = []
+
+    def popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return FakeProc()
+
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data",
+                 source=tmp_path / "foley.toml")
+    assert tray.relaunch(cfg, tmp_path / "browse.log", popen=popen) == 4242
+    (cmd, kwargs), = calls
+    assert cmd == [str(base / "pythonw.exe"), "-m", "foley.cli", "--config",
+                   str(tmp_path / "foley.toml"), "tray", "--log-file",
+                   str(tmp_path / "browse.log")]
+    assert kwargs["env"][tray.LAUNCHER_ENV] == str(scripts / "pythonw.exe")
+    assert kwargs["env"][tray.RELAUNCHED_ENV] == "1"
+    assert kwargs["close_fds"] and kwargs["stdin"] == subprocess.DEVNULL
+
+
+def test_relaunch_retries_when_the_job_forbids_breakaway(venv, tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False)
+    flags = []
+
+    def popen(cmd, **kwargs):
+        flags.append(kwargs["creationflags"])
+        if len(flags) == 1:
+            raise PermissionError("access denied")
+        return FakeProc()
+
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    tray.relaunch(cfg, "b.log", popen=popen)
+    assert flags[0] & 0x01000000 and not flags[1] & 0x01000000
+
+
+def _no_pystray(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pystray", None)  # import fails: run() returns 2
+
+
+def test_run_with_the_lock_held_exits_without_relaunching(tmp_path, monkeypatch):
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    monkeypatch.setattr(tray, "configure_logging", lambda path: None)
+    monkeypatch.setattr(tray, "should_relaunch", lambda: True)
+    monkeypatch.setattr(tray, "relaunch", lambda *a, **k: pytest.fail("relaunched"))
+    holder = tray._InstanceLock(cfg.data_dir / tray.LOCK_FILE)
+    assert holder.acquire()
+    try:
+        assert tray.run(cfg, tmp_path / "b.log") == 0
+    finally:
+        holder.release()
+
+
+def test_run_relaunches_and_leaves_the_lock_to_the_copy(tmp_path, monkeypatch):
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    monkeypatch.setattr(tray, "configure_logging", lambda path: None)
+    monkeypatch.setattr(tray, "should_relaunch", lambda: True)
+    lock_path = cfg.data_dir / tray.LOCK_FILE
+
+    def relaunch(cfg_, log_file):
+        copy = tray._InstanceLock(lock_path)  # the copy can take the lock now
+        assert copy.acquire()
+        copy.release()
+        return 99
+
+    monkeypatch.setattr(tray, "relaunch", relaunch)
+    assert tray.run(cfg, tmp_path / "b.log") == 0
+
+
+def test_run_carries_on_itself_when_the_copy_cannot_start(tmp_path, monkeypatch):
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    monkeypatch.setattr(tray, "configure_logging", lambda path: None)
+    monkeypatch.setattr(tray, "should_relaunch", lambda: True)
+
+    def relaunch(*_):
+        raise OSError("nope")
+
+    monkeypatch.setattr(tray, "relaunch", relaunch)
+    _no_pystray(monkeypatch)
+    assert tray.run(cfg, tmp_path / "b.log") == 2  # got as far as loading pystray

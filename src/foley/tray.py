@@ -3,9 +3,16 @@
 CONTRACT:
 
     run(cfg, log_file=None) -> int
-        Takes the single-instance lock (data_dir/tray.lock; returns 3 if another tray
-        holds it), starts `foley browse` as a child process (Supervisor) and shows the
-        icon until Quit, which stops the child cleanly and returns 0. Returns 2 when
+        Takes the single-instance lock (data_dir/tray.lock). If another tray holds it,
+        returns 0 at once without relaunching or writing to the log (the logon task
+        repeats every few minutes, so this is the normal case, not an error); a console
+        gets a one-line note on stderr. Then, if should_relaunch(), it releases the
+        lock, starts a detached copy of itself on the base interpreter (relaunch()) and
+        returns 0, so the venv launcher that started it exits too; the copy takes the
+        lock for real (a run that slips in between races the copy for the lock and one
+        of them exits quietly, so there is still one tray). If the copy cannot start it carries
+        on itself. Otherwise it starts `foley browse` as a child process (Supervisor) and
+        shows the icon until Quit, which stops the child cleanly and returns 0. Returns 2 when
         pystray cannot load. The menu: Open Foley (the default item, on click), Scan now
         or Stop scan, Restart server, Stop server or Start server, Open log, Quit.
         Restart starts a fresh Python process, so it picks up code changes in the
@@ -17,7 +24,29 @@ CONTRACT:
         [python, "-m", "foley.cli", ("--config", cfg.source), "browse", "--no-open",
          "--stop-on-stdin-eof", "--log-file", log_file]. python is the console
         interpreter beside sys.executable (python.exe for pythonw.exe) so the child has a
-        real stdin; it runs with no window.
+        real stdin, passed through direct_interpreter(); it runs with no window.
+    browse_env() -> dict[str, str]
+        The environment for that command: os.environ with __PYVENV_LAUNCHER__ set as
+        direct_interpreter() says (removed when it says None) and RELAUNCHED_ENV removed.
+    direct_interpreter(exe) -> (path, venv_exe | None)
+        One process instead of two on Windows. A venv's python.exe / pythonw.exe is a
+        launcher that starts the base interpreter as a child; running the base
+        interpreter of the same name (beside sys._base_executable) with
+        __PYVENV_LAUNCHER__=exe gives the same venv in one process. Returns (base, exe)
+        on Windows inside a venv when that base interpreter exists, else (exe, None):
+        run exe as it is.
+    tray_command(cfg, log_file) -> list[str]
+        [pythonw, "-m", "foley.cli", ("--config", cfg.source), "tray", "--log-file",
+         log_file]: the relaunched copy, on the base pythonw.exe when there is one.
+    should_relaunch() -> bool
+        True on Windows when this process runs in a venv through a launcher that
+        direct_interpreter() can bypass, unless it is itself the relaunched copy
+        (RELAUNCHED_ENV set). Never elsewhere.
+    relaunch(cfg, log_file, popen=subprocess.Popen) -> int
+        Starts tray_command() detached (no console, its own process group, out of the
+        caller's job when the job allows it, no inherited handles), with
+        __PYVENV_LAUNCHER__ and RELAUNCHED_ENV=1 set; returns its pid. Raises OSError
+        when it cannot start.
     default_log_file(cfg) -> Path        data_dir/logs/browse.log
     tray_log_path(log_file=None) -> Path TRAY_LOG beside `log_file`, else in the default
                                          data dir's logs/
@@ -27,8 +56,11 @@ CONTRACT:
                                          bind -> 127.0.0.1)
 
     class Supervisor(command, restart_delay=5.0, max_restarts=5, window=600.0,
-                     stop_timeout=20.0, clock=time.monotonic, popen=subprocess.Popen)
-        `command` is a list or a zero-arg callable returning one. Thread-safe.
+                     stop_timeout=20.0, clock=time.monotonic, popen=subprocess.Popen,
+                     env=None)
+        `command` is a list or a zero-arg callable returning one; `env` is the child's
+        whole environment, a zero-arg callable returning it, or None to inherit.
+        Thread-safe.
         start()      start the child if it is not running; clears the crash count
         stop()       close the child's stdin (browse then stops its scan and exits), wait
                      stop_timeout seconds, then kill its process tree; no restart follows
@@ -73,6 +105,8 @@ from foley.scans import _popen_kwargs, kill_tree
 log = logging.getLogger("foley.tray")
 
 TRAY_LOG = "tray.log"
+RELAUNCHED_ENV = "FOLEY_TRAY_RELAUNCHED"  # set on the copy relaunch() starts
+LAUNCHER_ENV = "__PYVENV_LAUNCHER__"  # CPython's: the venv interpreter to act as
 LOCK_FILE = "tray.lock"
 POLL_S = 2.0
 STATUS_TIMEOUT_S = 3.0
@@ -143,11 +177,86 @@ def _console_python() -> str:
     return str(exe)
 
 
-def browse_command(cfg: Config, log_file: str | os.PathLike) -> list[str]:
-    cmd = [_console_python(), "-m", "foley.cli"]
+def _gui_python() -> str:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        gui = exe.with_name("pythonw.exe")
+        if gui.exists():
+            return str(gui)
+    return str(exe)
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def direct_interpreter(exe: str | os.PathLike) -> tuple[str, str | None]:
+    exe = str(exe)
+    base = getattr(sys, "_base_executable", None)
+    if not _is_windows() or sys.prefix == sys.base_prefix or not base:
+        return exe, None
+    target = Path(base).with_name(Path(exe).name)
+    try:
+        if not target.is_file() or target.resolve() == Path(exe).resolve():
+            return exe, None
+    except OSError:
+        return exe, None
+    return str(target), exe
+
+
+def _child_env(venv_exe: str | None, **extra: str) -> dict[str, str]:
+    drop = (LAUNCHER_ENV.upper(), RELAUNCHED_ENV.upper())
+    env = {k: v for k, v in os.environ.items() if k.upper() not in drop}
+    if venv_exe is not None:
+        env[LAUNCHER_ENV] = venv_exe
+    env.update(extra)
+    return env
+
+
+def _cli_command(python: str, cfg: Config, args: list[str]) -> list[str]:
+    cmd = [python, "-m", "foley.cli"]
     if cfg.source is not None:
         cmd += ["--config", str(cfg.source)]
-    return cmd + ["browse", "--no-open", "--stop-on-stdin-eof", "--log-file", str(log_file)]
+    return cmd + args
+
+
+def browse_command(cfg: Config, log_file: str | os.PathLike) -> list[str]:
+    python, _ = direct_interpreter(_console_python())
+    return _cli_command(python, cfg, ["browse", "--no-open", "--stop-on-stdin-eof",
+                                      "--log-file", str(log_file)])
+
+
+def browse_env() -> dict[str, str]:
+    return _child_env(direct_interpreter(_console_python())[1])
+
+
+def tray_command(cfg: Config, log_file: str | os.PathLike) -> list[str]:
+    python, _ = direct_interpreter(_gui_python())
+    return _cli_command(python, cfg, ["tray", "--log-file", str(log_file)])
+
+
+def should_relaunch() -> bool:
+    if not _is_windows() or os.environ.get(RELAUNCHED_ENV):
+        return False
+    return direct_interpreter(sys.executable)[1] is not None
+
+
+def relaunch(cfg: Config, log_file: str | os.PathLike,
+             popen: Callable[..., subprocess.Popen] = subprocess.Popen) -> int:
+    cmd = tray_command(cfg, log_file)
+    env = _child_env(direct_interpreter(_gui_python())[1], **{RELAUNCHED_ENV: "1"})
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+    kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL, close_fds=True, env=env)
+    try:  # out of Task Scheduler's job, so the end of the task run cannot take it along
+        proc = popen(cmd, creationflags=flags | breakaway, **kwargs)
+    except OSError:
+        if not breakaway:
+            raise
+        proc = popen(cmd, creationflags=flags, **kwargs)  # the job forbids breaking away
+    return proc.pid
 
 
 def local_url(cfg: Config) -> str:
@@ -166,8 +275,10 @@ class Supervisor:
     def __init__(self, command: list[str] | Callable[[], list[str]],
                  restart_delay: float = 5.0, max_restarts: int = 5, window: float = 600.0,
                  stop_timeout: float = 20.0, clock: Callable[[], float] = time.monotonic,
-                 popen: Callable[..., subprocess.Popen] = subprocess.Popen):
+                 popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+                 env: dict[str, str] | Callable[[], dict[str, str]] | None = None):
         self._command = command
+        self._env = env
         self.restart_delay = restart_delay
         self.max_restarts = max_restarts
         self.window = window
@@ -192,10 +303,11 @@ class Supervisor:
 
     def _spawn(self) -> None:
         cmd = self._command() if callable(self._command) else list(self._command)
+        env = self._env() if callable(self._env) else self._env
         try:
             self._proc = self._popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, **_popen_kwargs())
+                stderr=subprocess.DEVNULL, env=env, **_popen_kwargs())
         except OSError as e:
             log.error("foley tray: cannot start %s: %s", cmd[0], e)
             self._proc = None
@@ -383,7 +495,7 @@ class _TrayApp:
         self.cfg = cfg
         self.log_file = log_file
         self.url = local_url(cfg)
-        self.supervisor = Supervisor(lambda: browse_command(cfg, log_file))
+        self.supervisor = Supervisor(lambda: browse_command(cfg, log_file), env=browse_env)
         self.pystray = pystray
         self.state = "starting"
         self.status: dict | None = None
@@ -555,13 +667,31 @@ class _TrayApp:
             self.supervisor.stop()  # also when the icon loop ends some other way
 
 
+def _already_running(cfg: Config) -> int:
+    log.debug("foley tray: another foley tray is already running for %s", cfg.data_dir)
+    if sys.stderr is not None:  # None under pythonw.exe
+        print(f"foley tray: already running for {cfg.data_dir}", file=sys.stderr)
+    return 0
+
+
 def run(cfg: Config, log_file: str | os.PathLike | None = None) -> int:
     log_path = Path(log_file) if log_file else default_log_file(cfg)
     configure_logging(tray_log_path(log_path))
     lock = _InstanceLock(cfg.data_dir / LOCK_FILE)
     if not lock.acquire():
-        log.error("foley tray: another foley tray is already running for %s", cfg.data_dir)
-        return 3
+        return _already_running(cfg)
+    if should_relaunch():
+        lock.release()  # the copy takes it for real (see the contract)
+        try:
+            pid = relaunch(cfg, log_path)
+        except OSError as e:
+            log.warning("foley tray: cannot start on the base interpreter (%s); "
+                        "running through the launcher instead", e)
+            if not lock.acquire():
+                return _already_running(cfg)
+        else:
+            log.info("foley tray: continuing as pid %s on the base interpreter", pid)
+            return 0
     try:
         try:
             import pystray

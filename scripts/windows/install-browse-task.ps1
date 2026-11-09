@@ -10,6 +10,14 @@
     icon. The task runs under your normal logon, so it reaches a NAS share with your
     own credentials: no stored password and no admin rights needed.
 
+    The task also repeats every five minutes, which brings Foley back if it was killed.
+    The tray holds a single-instance lock, so a repeat while it runs exits at once. The
+    tray restarts itself on the base Python interpreter, so that it and the server are
+    one process each, and the task's own run then ends: Task Scheduler shows the task
+    as "Ready", not "Running", while Foley runs. Look for the tray icon, or for
+    `-m foley.cli tray` in Task Manager's command lines, instead. Installing or
+    uninstalling stops a running tray for this log file (its server stops with it).
+
     Host, port and allowed host names come from the [browse] table of foley.toml, and
     the daily library scan from [schedule] (or the Scans dialog in the UI).
 
@@ -35,9 +43,24 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# The tray runs outside the task once it has restarted itself (see above), so stopping
+# the task does not stop it. Stopping the tray closes the server's standard input, and
+# the server then stops cleanly.
+function Stop-FoleyTray {
+    $trays = @(Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains('foley.cli') -and
+                       $_.CommandLine.Contains(' tray ') -and $_.CommandLine.Contains($LogFile) })
+    foreach ($p in $trays) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "Stopped foley tray (pid $($p.ProcessId))."
+    }
+    if ($trays) { Start-Sleep -Seconds 3 }  # let the server release its port
+}
+
 if ($Uninstall) {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $TaskName
+        Stop-FoleyTray
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host "Removed task '$TaskName'."
     } else {
@@ -65,6 +88,10 @@ $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument ($arguments -join ' ') `
     -WorkingDirectory $env:LOCALAPPDATA  # not the repo: a stray ./foley.toml there must not win
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+# Repeat every five minutes for as long as the session lasts (no duration = indefinitely).
+$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
+$trigger.Repetition.StopAtDurationEnd = $false  # never stop a running Foley
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -75,9 +102,11 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force `
     -Description "Foley library browser ($(if ($Headless) { 'foley browse' } else { 'foley tray' })) from $repo. Log: $LogFile" | Out-Null
-Write-Host "Registered task '$TaskName' (at logon of $user)."
+Write-Host "Registered task '$TaskName' (at logon of $user, then every 5 minutes)."
 
 if (-not $NoStart) {
+    Stop-ScheduledTask -TaskName $TaskName  # a headless server still runs inside the task
+    Stop-FoleyTray  # so the new run starts the current code
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "Started. Log: $LogFile"
 }

@@ -58,7 +58,7 @@ def test_tools_registered_with_claude_facing_descriptions(server):
         "LUFS" in tools["search_audio"].description
         and "seconds" in tools["search_audio"].description
     )
-    assert "Read tool" in tools["render_comparison"].description
+    assert "returns the image itself" in tools["render_comparison"].description.lower()
     assert "CLAP" in tools["find_similar"].description
     assert tools["find_similar"].input_schema["required"] == ["asset_id"]
     assert {"max_duration_s", "is_music", "project", "limit"} <= set(

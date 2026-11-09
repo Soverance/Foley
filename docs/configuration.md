@@ -70,6 +70,15 @@ Leave both unset to use what `foley eval --adopt` recorded in the catalog (see [
 
 Serving beyond your own machine has licence and security implications; read [browse.md](browse.md#serving-it-on-your-network) first.
 
+## `[mcp]`
+
+The shared MCP endpoint, served by `foley browse` at `/mcp` (see [mcp-tools.md](mcp-tools.md#the-shared-endpoint-recommended-with-an-always-on-foley-browse)).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Serve the MCP tools at `/mcp` so Claude Code sessions connect to this server instead of each starting `foley-mcp`. When the server listens on a network address, requests need the token that `foley mcp token` prints. |
+| `project_roots` | `[]` | Folders `import_to_project` may write under when called through `/mcp`, such as `["C:/Projects"]`. A project outside all of them is refused; with none, every import through `/mcp` is refused. Has no effect on `foley-mcp` over stdio. |
+
 ## `[schedule]`
 
 The daily library scan that a running `foley browse` performs (an incremental `foley index`, read-only on the library).

@@ -8,6 +8,12 @@ clap_checkpoints(cfg) -> list[str]: the [models] clap names the indexer computes
 
 Helpers shared with callers: parse_hhmm(value) -> "HH:MM" (ValueError if not a 24-hour
 time) and normalize_host(name) -> the lowercase host without port, brackets or trailing dot.
+
+[mcp] (the shared MCP endpoint that `foley browse` serves at /mcp; docs/design.md, "One
+shared server"): enabled (bool, default false) -> cfg.mcp_enabled; project_roots (list of
+folder paths) -> cfg.mcp_project_roots, the only folders `import_to_project` may write
+under when called through that endpoint. in_project_roots(cfg, path) -> bool tells whether
+a path lies in (or is) one of them, comparing real, case-normalized paths.
 """
 
 from __future__ import annotations
@@ -60,6 +66,9 @@ class Config:
     models_device: str = "auto"  # [models] device: auto | cuda | cpu
     # [models] clap: CLAP checkpoints the indexer computes; empty = all of them
     models_clap: list[str] = field(default_factory=list)
+    mcp_enabled: bool = False  # [mcp] enabled: serve /mcp from `foley browse`
+    # [mcp] project_roots: where import_to_project may write through /mcp
+    mcp_project_roots: list[Path] = field(default_factory=list)
     source: Path | None = None  # the file this config was loaded from
 
     @property
@@ -184,6 +193,7 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
         raise ConfigError(f"schedule.startup_delay_minutes must be >= 0, got {delay!r}")
     cfg.schedule_startup_delay_minutes = float(delay)
     _models(cfg, data.get("models", {}))
+    _mcp(cfg, data.get("mcp", {}))
     cfg.source = source
     check_data_dir(cfg)
     return cfg
@@ -214,6 +224,19 @@ def _models(cfg: Config, models: dict) -> None:
             f"models.clap: unknown checkpoint(s) {unknown}; known: {', '.join(CLAP_CHECKPOINTS)}"
         )
     cfg.models_clap = list(dict.fromkeys(clap))
+
+
+def _mcp(cfg: Config, mcp: dict) -> None:
+    cfg.mcp_enabled = _bool(mcp.get("enabled", cfg.mcp_enabled), "mcp.enabled")
+    roots = mcp.get("project_roots", [])
+    if not isinstance(roots, list) or not all(isinstance(r, str) and r.strip() for r in roots):
+        raise ConfigError("mcp.project_roots must be a list of folder paths")
+    cfg.mcp_project_roots = [Path(r.strip()) for r in roots]
+
+
+def in_project_roots(cfg: Config, path: Path) -> bool:
+    """Whether `path` is one of [mcp] project_roots or lies inside one."""
+    return any(_inside(Path(path), root) for root in cfg.mcp_project_roots)
 
 
 def _inside(child: Path, parent: Path) -> bool:

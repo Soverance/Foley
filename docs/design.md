@@ -33,8 +33,8 @@ flowchart LR
     index --> cat[("catalog.db<br/>derived, rebuildable")]
     index --> img[("image cache")]
     led[("ledger.db<br/>decisions · usages · dedupe log")]
-    cat --> mcp["foley-mcp<br/>(Claude Code)"]
-    cat --> browse["foley browse<br/>(people)"]
+    cat --> browse["foley browse<br/>web UI (people) · /mcp (Claude Code)"]
+    cat --> mcp["foley-mcp, stdio<br/>(machines without a server)"]
     cat --> engine["game-engine tools<br/>(read SQLite directly)"]
     led <--> mcp
     led <--> browse
@@ -42,7 +42,7 @@ flowchart LR
     browse -- "daily scan" --> index
 ```
 
-A Python indexer writes a local catalog. Three kinds of consumer read it: the MCP server for Claude Code, the browser for people, and any game-engine tool (for example an in-editor review board written in C#). **The SQLite files are the only interface between them.** No consumer calls another's code, so a C# tool needs nothing but an SQLite driver.
+A Python indexer writes a local catalog. Three kinds of consumer read it: the MCP tools for Claude Code, the browser for people, and any game-engine tool (for example an in-editor review board written in C#). The MCP tools are normally served by the browse server's own process at `/mcp`, so a whole studio shares one server; `foley-mcp` serves the same tools over stdio on a machine that runs no server (see [Claude Code integration](#claude-code-integration)). **The SQLite files are the only interface between consumers.** An engine tool calls no Foley code, so a C# tool needs nothing but an SQLite driver.
 
 - **`catalog.db`** holds everything *derived* from the library: assets, features, tags, captions, embeddings, the search index and image records. It can be deleted and rebuilt from the library at any time.
 - **`ledger.db`** holds what *cannot* be regenerated: people's decisions, which game uses which file, and the log of every change Foley makes to the library. Back it up; never rebuild it.
@@ -128,7 +128,7 @@ The MCP server keeps results compact (ids, paths, a caption, the top tags and a 
 The intended selection workflow, which a game repo can put in its own CLAUDE.md:
 
 1. `search_audio` with a descriptive query and technical filters (duration, loudness, attack).
-2. `render_comparison` on the top 4–6, then read the image.
+2. `render_comparison` on the top 4–6, which returns the comparison image inline.
 3. `find_similar` from the best near-miss, if needed.
 4. `import_to_project`, which copies the file in and loudness-normalizes it. Per-project targets live in the game repo's `foley.project.toml`:
    - clips of 0.4 s or more are normalized to integrated LUFS, shorter ones on true peak;
@@ -139,6 +139,29 @@ The intended selection workflow, which a game repo can put in its own CLAUDE.md:
 5. Hero slots and low-confidence picks go to a person for review.
 
 A person can hand picks to Claude too: sounds starred in `foley browse` come back through the MCP tool `get_shortlist`.
+
+### One shared server
+
+The same tools are served two ways, built from one registration (`mcp_server.build_server()`) so that names, schemas and descriptions cannot drift between them:
+
+- **The shared endpoint**, for any machine that runs `foley browse` (normally always on, under `foley tray`). The browse server answers MCP at `/mcp` over Streamable HTTP. Every Claude Code session on the network connects to that one process, so a session starts no Foley process of its own, and the CLAP text encoder, the catalog connection and the caches are loaded once for everyone. A game repo's `.mcp.json` names the URL, and the token comes from each person's environment, never from the repo:
+
+  ```json
+  {"mcpServers": {"foley": {"type": "http", "url": "http://foley.example.lan/mcp",
+    "headers": {"Authorization": "Bearer ${FOLEY_MCP_TOKEN}"}}}}
+  ```
+
+- **`foley-mcp` over stdio**, for a machine with a catalog but no server. Claude Code starts one process per session, as before.
+
+Decisions for the endpoint:
+
+- **Stateless JSON on the existing stdlib server.** `POST /mcp` carries one JSON-RPC message and is answered with `application/json`; a notification gets 202, and `GET /mcp` gets 405 because the server never pushes messages. There are no session ids, so restarting the server (to load new code) costs connected sessions at most the call in flight. Every Foley tool is plain request and response, so streaming adds nothing. The stdlib server keeps one port, one process and the existing Host and Origin checks; it hands each `/mcp` request to the MCP SDK's own Streamable HTTP handler (stateless, JSON responses), called in-process, so the protocol itself (version negotiation, JSON-RPC errors) is the SDK's and no ASGI server is added.
+- **One worker thread runs the tools**, with its own catalog connection (SQLite connections are thread-bound), in arrival order. Searches take milliseconds; a long `import_to_project` delays other sessions' calls by its own duration, which is acceptable for a studio's handful of sessions. The web UI's request threads are unaffected.
+- **Off by default.** `[mcp] enabled = true` in `foley.toml` turns the endpoint on.
+- **A token gates it.** The browse UI stays unauthenticated, but `import_to_project` writes files, so when the server is bound to a non-loopback address every `/mcp` request must carry `Authorization: Bearer <token>`. The server creates the token on first start in `<data_dir>/mcp_token`, and `foley mcp token` prints it. Comparison is constant-time. The Host allow-list and Origin check apply as for the UI; the Origin check is also what the MCP specification requires against DNS rebinding.
+- **Imports land only in configured project folders.** Over HTTP the server writes on its own disk, as its own user, for whoever holds the token, so `project_root` must lie under one of `[mcp] project_roots`; anything else is refused with a message naming that setting. Over stdio nothing changes: the session's own user writes on its own machine. As a result, the shared endpoint imports only into projects the server machine can reach. Importing on other machines is on the roadmap.
+- **Images come back inline.** `render_comparison` returns the PNG as MCP image content on both transports, rather than a file path for Claude to Read: a remote session cannot read a path on the server, and inline saves a tool call. The stdio result keeps its `image` path as well, for people.
+- **When the server is down, every session loses Foley** until it is back (Claude Code reconnects from its `/mcp` menu). That is why the tray restarts the server and the logon task restarts the tray (see [The browser](#the-browser)).
 
 ## Game-engine integration
 
@@ -164,12 +187,17 @@ The removal commands (`plan`, `apply`, `restore`, `purge`) are designed but **no
 
 ## The browser
 
-`foley browse` is a stdlib HTTP server with a static, dependency-free UI: no build step, no CDN, fonts bundled, so it works offline. It reads the catalog, streams audio from the library read-only (with HTTP range requests for seeking), renders peaks and overview images on demand, and writes only caches, the shortlist, the scan schedule and the configured test set. `foley tray` runs it as a child process behind a notification-area icon, so a person can restart it to load new code, stop it, or start a scan without a terminal. The tray stops the server by closing its stdin, so a running scan is stopped cleanly rather than killed. It listens on loopback by default. On a LAN it answers only configured host names, which blocks DNS rebinding, and it has no authentication. Serve it only to people licensed to use the library, because sample licences usually forbid wider access. See [browse.md](browse.md).
+`foley browse` is a stdlib HTTP server with a static, dependency-free UI: no build step, no CDN, fonts bundled, so it works offline. It reads the catalog, streams audio from the library read-only (with HTTP range requests for seeking), renders peaks and overview images on demand, and writes only caches, the shortlist, the scan schedule and the configured test set. `foley tray` runs it as a child process behind a notification-area icon, so a person can restart it to load new code, stop it, or start a scan without a terminal. The tray stops the server by closing its stdin, so a running scan is stopped cleanly rather than killed. It listens on loopback by default.
+
+**Two processes, no more.** On Windows, a venv's `python.exe` and `pythonw.exe`, and uv's script `.exe` wrappers, are launchers that start the real interpreter as a child, so each Python program would show two or three times in Task Manager. For its long-running processes Foley starts the base interpreter (`sys._base_executable`) directly, with `__PYVENV_LAUNCHER__` set to the venv's interpreter. That is the mechanism CPython's own launcher uses, and it gives the same venv in one process. The tray starts the server that way, and a tray that was itself started through a launcher starts a copy of itself the same way and exits, which lets the launcher exit too. An always-on machine therefore runs two Foley processes, tray and server, and no Claude Code session adds any. Elsewhere (Linux, or no venv) the plain interpreter is used. Task Manager still names both processes "Python", because Windows takes the name from the executable and Foley ships none of its own. Their command lines (Details tab, "Command line" column) read `-m foley.cli tray` and `-m foley.cli browse`.
+
+**Recovery.** The tray restarts a server that exits unexpectedly (at most a few times in ten minutes). The Windows logon task also repeats every five minutes: the tray holds a single-instance lock, so a repeat run exits at once while a tray is alive and starts a new one if the tray was killed. On a LAN it answers only configured host names, which blocks DNS rebinding, and it has no authentication. Serve it only to people licensed to use the library, because sample licences usually forbid wider access. See [browse.md](browse.md).
 
 ## Roadmap
 
 - **Done:** catalog, sync, DSP features, loudness, captions, keyword search, images, the MCP server and import, the browser with daily scans, AudioSet tags, CLAP embeddings, hybrid search, find-similar and evaluation.
-- **Next, the review loop:**
+- **Next, one shared server:** the `/mcp` endpoint, inline comparison images, the two-process tray and the self-healing logon task (see [One shared server](#one-shared-server) and [The browser](#the-browser)).
+- **Then, the review loop:**
   - an engine-side review queue writing `decisions`;
   - `get_examples` (past decisions as few-shot context);
   - `record_decision`;
@@ -180,4 +208,5 @@ The removal commands (`plan`, `apply`, `restore`, `purge`) are designed but **no
   - a per-category preference model trained on embeddings and features plus past decisions, exposed as a predicted-approval score;
   - an audio-captioning model, adopted only if it beats the templated captions on the test set;
   - catalog snapshots for other machines;
+  - importing into a project on another machine through the shared endpoint (the server returns the normalized file, the client writes it);
   - optional music descriptors in a separate process, so the core never imports AGPL code.

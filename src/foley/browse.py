@@ -139,6 +139,14 @@ CONTRACT:
                                   409 if none is running
         GET  /api/scans/log/<name>  text/plain; only names matching scans.LOG_NAME that
                                   exist in data_dir/logs (else 404)
+        POST /mcp                 the shared MCP endpoint (foley.mcp_http; docs/design.md,
+                                  "One shared server"), only with [mcp] enabled (else
+                                  404). Host and Origin checks as for every request; when
+                                  bound to a non-loopback address, "Authorization: Bearer
+                                  <token>" (mcp_http.load_or_create_token) is required
+                                  (else 401). Other methods -> 405; bodies over
+                                  mcp_http.MAX_BODY_BYTES -> 413. Each tools/call is logged
+                                  (tool name and client address).
 
     LISTING (/api/list): params folder, q, min_duration, max_duration, min_lufs, max_lufs,
         max_attack, is_music (1 = music, 0 = not known to be music: 0 or untagged), ext
@@ -211,6 +219,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 
+from foley import mcp_http
 from foley import scans as scans_mod
 from foley.catalog import db
 from foley.config import Config, normalize_host
@@ -812,6 +821,12 @@ class BrowseApp:
         if bound and not is_loopback(bound):
             self.allowed_hosts |= _machine_names()
         self.scans = scans if scans is not None else scans_mod.ScanScheduler(cfg)
+        self.mcp: mcp_http.McpEndpoint | None = None
+        self.mcp_token: str | None = None  # required on /mcp when set
+        if cfg.mcp_enabled:
+            self.mcp = mcp_http.McpEndpoint(cfg)
+            if not bound or not is_loopback(bound):
+                self.mcp_token = mcp_http.load_or_create_token(cfg)
         self.shortlist = Shortlist(shortlist_path(cfg))
         self.peaks_dir = cfg.data_dir / "peaks"
         self.check_interval_s = CHECK_INTERVAL_S
@@ -1583,6 +1598,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             parts = urlsplit(self.path)
             path = unquote(parts.path)
+            if path == mcp_http.MCP_PATH:
+                self._route_mcp(method)
+                return
             qs = parse_qs(parts.query, keep_blank_values=True)
             if method in ("POST", "DELETE"):
                 self.close_connection = True  # never reuse a connection after a body
@@ -1602,6 +1620,63 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             log.exception("error handling %s %s", method, self.path)
             self._safe_error(500, f"internal error: {e.__class__.__name__}: {e}")
+
+    def _route_mcp(self, method: str) -> None:
+        # Until the body is read, an error response closes the connection (and says so,
+        # or a keep-alive client would reuse a dead socket). A fully read request keeps
+        # it open: Claude Code makes many small calls.
+        app = self.app
+        self.close_connection = True
+        close = {"Connection": "close"}
+
+        def fail(status: int, message: str, extra: dict | None = None) -> None:
+            self._error(status, message, {**close, **(extra or {})})
+
+        if app.mcp is None:
+            fail(404, "the MCP endpoint is off: set [mcp] enabled = true in foley.toml")
+            return
+        if not self._origin_ok():
+            fail(403, "cross-origin request refused")
+            return
+        if app.mcp_token is not None and not mcp_http.authorized(
+                self.headers.get("Authorization"), app.mcp_token):
+            fail(401, "missing or wrong token: send Authorization: Bearer <token> "
+                      "(`foley mcp token` on the Foley server prints it)",
+                 {"WWW-Authenticate": 'Bearer realm="foley"'})
+            return
+        if method != "POST":
+            fail(405, "the Foley MCP endpoint takes POST only", {"Allow": "POST"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            fail(411, "Content-Length required")
+            return
+        if length < 0 or length > mcp_http.MAX_BODY_BYTES:
+            fail(413 if length > 0 else 400, "request too large" if length > 0
+                 else "bad Content-Length")
+            return
+        body = self.rfile.read(length)
+        if len(body) < length:
+            return  # the client went away mid-body
+        self.close_connection = False
+        try:
+            msg = json.loads(body)
+            if isinstance(msg, dict) and msg.get("method") == "tools/call":
+                name = (msg.get("params") or {}).get("name")
+                log.info("mcp: %s from %s", name, self.client_address[0])
+        except (ValueError, AttributeError):
+            pass  # the SDK answers malformed messages itself
+        status, headers, out = app.mcp.handle(
+            "POST", list(self.headers.items()), body, tuple(self.client_address[:2]))
+        ctype = "application/json"
+        extra = {"Cache-Control": "no-store"}
+        for k, v in headers:
+            if k.lower() == "content-type":
+                ctype = v
+            elif k.lower() not in ("content-length", "connection", "date", "server"):
+                extra[k] = v
+        self._send(status, out, ctype, extra)
 
     def _safe_error(self, status: int, message: str) -> None:
         try:
@@ -1899,6 +1974,12 @@ def serve(cfg: Config, host: str | None = None, port: int | None = None,
             ):
                 say(line, logging.WARNING)
     say(f"foley browse: {url}  (catalog {cfg.catalog_path}; Ctrl+C to stop)")
+    mcp = getattr(server.app, "mcp", None)
+    if mcp is not None:
+        roots = ", ".join(str(r) for r in cfg.mcp_project_roots) or "none: imports refused"
+        auth = "token required" if server.app.mcp_token else "no token on loopback"
+        say(f"foley browse: MCP endpoint {url.rstrip('/')}{mcp_http.MCP_PATH} ({auth}; "
+            f"import_to_project roots: {roots})")
     scheduler = server.app.scans
     if schedule:
         scheduler.start()
@@ -1915,4 +1996,6 @@ def serve(cfg: Config, host: str | None = None, port: int | None = None,
     finally:
         if schedule:
             scheduler.shutdown(stop_running=True)
+        if mcp is not None:
+            mcp.stop()
         server.server_close()

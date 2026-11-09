@@ -237,6 +237,17 @@ def cmd_tray(cfg, args) -> int:
     return tray.run(cfg, log_file=args.log_file)
 
 
+def cmd_mcp_token(cfg, args) -> int:
+    from foley import mcp_http
+
+    token = mcp_http.load_or_create_token(cfg)
+    print(token)
+    print(f"(stored in {mcp_http.token_path(cfg)}; clients send it as "
+          "'Authorization: Bearer <token>', e.g. via FOLEY_MCP_TOKEN in .mcp.json)",
+          file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="foley", description=__doc__)
     p.add_argument("--config", help="path to foley.toml")
@@ -329,6 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the server's log (default <data dir>/logs/browse.log); the tray "
                    "logs to tray.log beside it")
     s.set_defaults(func=cmd_tray)
+
+    s = sub.add_parser("mcp", help="the shared MCP endpoint that foley browse serves at /mcp")
+    mcp_sub = s.add_subparsers(dest="mcp_command", required=True)
+    t = mcp_sub.add_parser("token", help="print the endpoint's bearer token (created if absent)")
+    t.set_defaults(func=cmd_mcp_token)
     return p
 
 

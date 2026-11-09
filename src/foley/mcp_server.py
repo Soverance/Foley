@@ -1,4 +1,5 @@
-"""`foley-mcp`: the MCP server Claude Code talks to (stdio transport).
+"""The MCP tools Claude Code talks to: `foley-mcp` over stdio, or the shared `/mcp`
+endpoint of `foley browse` (foley.mcp_http) built from the same registration.
 
 CONTRACT (Phase 1 tools; Phase 2 adds the ledger tools):
 
@@ -10,10 +11,12 @@ CONTRACT (Phase 1 tools; Phase 2 adds the ledger tools):
                  min/max_lufs?, min/max_attack_s?, project?, limit=20)
         -> search.find_similar(...) result: nearest neighbours by CLAP embedding
     describe(asset)                      asset id or library-relative path -> search.describe
-    render_comparison(asset_ids)         2-6 ids -> {"image": absolute PNG path, "assets": [...]}
-                                         (tool description tells Claude to Read the PNG)
+    render_comparison(asset_ids)         2-6 ids -> two content blocks: the grid PNG as MCP
+                                         image content, then JSON {"assets": [...]} (stdio
+                                         adds "image": the absolute PNG path, for people)
     import_to_project(asset_id, project_root, dest, usage_key?, target_lufs?, overwrite=False)
-        -> importer.import_to_project result
+        -> importer.import_to_project result. In shared mode project_root must lie under
+           [mcp] project_roots (config.in_project_roots), else ToolError naming that setting
     catalog_status()                     -> status.catalog_status
     get_shortlist()                      -> {"count": n, "items": [{id, path, note, caption,
                                          duration_s, lufs, content_hash, added_at, status}]}
@@ -25,7 +28,10 @@ CONTRACT (Phase 1 tools; Phase 2 adds the ledger tools):
     returns and when to use it. Config comes from foley.config.load() (FOLEY_CONFIG
     env or default locations). No tool may modify the library.
 
-    main() runs the server over stdio.
+    build_server(shared=False) -> the SDK server with every tool registered. shared=True
+        is the /mcp endpoint's flavour: no server-side image path in render_comparison
+        results, and import_to_project limited to [mcp] project_roots.
+    main() runs build_server() over stdio.
 
 DESIGN NOTES:
 
@@ -40,6 +46,7 @@ DESIGN NOTES:
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -50,16 +57,19 @@ from foley.catalog import db
 try:  # mcp >= 2
     from mcp.server.mcpserver import MCPServer as _Server
     from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.server.mcpserver.utilities.types import Image
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server
     from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.server.fastmcp.utilities.types import Image
+from mcp.types import TextContent
 
 INSTRUCTIONS = (
     "Foley indexes a sound library you cannot hear. Search it with a short description of "
     "the sound (search_audio blends keyword matching with CLAP audio-text similarity), look "
     "at spectrogram images, then import the chosen file into the game project. Typical flow: "
     "search_audio, find_similar on a good candidate to see alternatives that sound alike, "
-    "render_comparison on the top 4-6 candidates (then view the PNG with your Read tool; in "
+    "render_comparison on the top 4-6 candidates (it returns the comparison image itself; in "
     "it near-black navy is silence, cyan to white is loud, the orange line is the RMS "
     "envelope), "
     "import_to_project. get_shortlist returns the sounds the user starred after listening in "
@@ -223,6 +233,7 @@ def tool_describe(asset: int | str) -> dict:
 
 
 def tool_render_comparison(asset_ids: list[int]) -> dict:
+    """{"image": absolute PNG path, "assets": [...]}; build_server turns it into content."""
     from foley import images
 
     try:
@@ -260,10 +271,20 @@ def tool_import_to_project(
     usage_key: str | None = None,
     target_lufs: float | None = None,
     overwrite: bool = False,
+    shared: bool = False,
 ) -> dict:
     from foley import importer
 
     try:
+        if shared:
+            cfg = get_config()
+            if not config_mod.in_project_roots(cfg, Path(project_root)):
+                roots = ", ".join(str(r) for r in cfg.mcp_project_roots) or "none configured"
+                raise ToolError(
+                    f"the shared Foley server imports only into folders listed in [mcp] "
+                    f"project_roots of its foley.toml (currently: {roots}); {project_root} is "
+                    "not under any of them. Ask the person running the Foley server to add it."
+                )
         return importer.import_to_project(
             get_config(),
             get_conn(),
@@ -343,8 +364,8 @@ DESCRIBE_DESCRIPTION = (
 COMPARISON_DESCRIPTION = (
     "Render 2-6 candidate sounds into ONE grid PNG (waveform on top, log-mel spectrogram "
     "below, identical scales and a shared time axis so lengths and spectra compare "
-    "visually). Returns {image: absolute PNG path, assets: [...]}. You cannot hear audio: "
-    "view the image with your Read tool on the returned `image` path, then choose by "
+    "visually). Returns the image itself, then JSON {assets: [{id, path, duration_s, lufs}]} "
+    "in grid order. You cannot hear audio: look at the image, then choose by "
     "duration, attack shape, brightness and noisiness. Reading it: the waveform is cyan on "
     "a fixed -1..1 scale (dashed lines at -6 and -20 dBFS) and the orange line is its RMS "
     "envelope; the spectrogram runs 20 Hz to 24 kHz on a mel axis at a fixed -80..0 dBFS, "
@@ -378,7 +399,15 @@ SHORTLIST_DESCRIPTION = (
 )
 
 
-def build_server():
+def _comparison_content(result: dict, shared: bool) -> list:
+    png = Path(result["image"]).read_bytes()
+    info = {"assets": result["assets"]}
+    if not shared:
+        info["image"] = result["image"]
+    return [Image(data=png, format="png"), TextContent(type="text", text=json.dumps(info))]
+
+
+def build_server(shared: bool = False):
     server = _Server("foley", instructions=INSTRUCTIONS)
 
     @server.tool(name="search_audio", description=SEARCH_DESCRIPTION)
@@ -436,8 +465,12 @@ def build_server():
         return tool_describe(asset)
 
     @server.tool(name="render_comparison", description=COMPARISON_DESCRIPTION)
-    async def render_comparison(asset_ids: list[int]) -> dict:
-        return tool_render_comparison(asset_ids)
+    async def render_comparison(asset_ids: list[int]) -> list[Image | TextContent]:
+        result = tool_render_comparison(asset_ids)
+        try:
+            return _comparison_content(result, shared)
+        except OSError as e:
+            raise ToolError(f"cannot read the rendered image: {e}") from e
 
     @server.tool(name="import_to_project", description=IMPORT_DESCRIPTION)
     async def import_to_project(
@@ -449,7 +482,7 @@ def build_server():
         overwrite: bool = False,
     ) -> dict:
         return tool_import_to_project(
-            asset_id, project_root, dest, usage_key, target_lufs, overwrite
+            asset_id, project_root, dest, usage_key, target_lufs, overwrite, shared=shared
         )
 
     @server.tool(name="catalog_status", description=STATUS_DESCRIPTION)
