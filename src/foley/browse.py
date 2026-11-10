@@ -1918,6 +1918,39 @@ def make_server(cfg: Config, host: str | None = None, port: int | None = None,
     return BrowseServer(cfg, host, port, verbose=verbose, scans=scans)
 
 
+def _wait_for_pipe_eof(stream, interval: float = 0.5) -> bool:
+    """On Windows, wait until the pipe behind `stream` is closed, without a pending read.
+
+    A thread blocked in ReadFile on a synchronous pipe makes other calls on that handle
+    wait for it, and loading some DLLs touches the standard handles: with a blocking
+    read on stdin, loading the CLAP model (torch, scipy) hung the whole server. So this
+    polls PeekNamedPipe instead and drains whatever arrives. Returns False when it does
+    not apply (not Windows, or stdin is not a pipe): the caller then reads normally.
+    """
+    if os.name != "nt":
+        return False
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+    kernel32.PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                       wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD),
+                                       wintypes.LPVOID]
+    fd = stream.fileno()
+    handle = msvcrt.get_osfhandle(fd)
+    if kernel32.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
+        return False
+    available = wintypes.DWORD()
+    while kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+        if available.value:
+            os.read(fd, available.value)  # never blocks: that much is waiting
+        else:
+            time.sleep(interval)
+    return True  # broken pipe: the parent closed its end
+
+
 def _stop_on_stdin_eof(server: BrowseServer, say) -> None:
     """Shut `server` down once stdin reaches end of file (the parent closed the pipe)."""
     stream = sys.stdin
@@ -1928,8 +1961,9 @@ def _stop_on_stdin_eof(server: BrowseServer, say) -> None:
 
     def watch() -> None:
         try:
-            while stream.buffer.read(4096):
-                pass
+            if not _wait_for_pipe_eof(stream):
+                while stream.buffer.read(4096):
+                    pass
         except (OSError, ValueError):
             pass
         say("foley browse: stopping (standard input closed)")

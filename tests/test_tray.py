@@ -509,3 +509,20 @@ def test_cli_save_icon(cfg, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(tray, "configure_logging", lambda path: None)
     assert cli.main(["tray", "--save-icon", str(tmp_path / "f.ico")]) == 0
     assert (tmp_path / "f.ico").is_file()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows pipes only")
+def test_stdin_watch_polls_the_pipe_without_a_pending_read():
+    # A blocking read on stdin hung CLAP loading in the server (browse._wait_for_pipe_eof).
+    import os
+    import threading
+
+    from foley import browse
+
+    r, w = os.pipe()
+    os.write(w, b"some bytes the watcher must drain")
+    threading.Timer(0.3, os.close, (w,)).start()
+    with open(r, "rb") as stream:
+        t = time.monotonic()
+        assert browse._wait_for_pipe_eof(stream, interval=0.05) is True
+    assert time.monotonic() - t < 5
