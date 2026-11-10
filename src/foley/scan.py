@@ -4,16 +4,19 @@ CONTRACT:
 
     METADATA_VERSION: str
 
-    @dataclass ScannedFile: rel_path (posix, relative to root), size_bytes, mtime_ns, ext (lower)
+    @dataclass ScannedFile: rel_path (posix, relative to root), size_bytes, mtime_ns, ext (lower),
+                            sidecar: ScannedFile | None (audio only: the <stem>.json in the
+                            same folder, stem compared case-insensitively)
     @dataclass ScanResult: audio: list[ScannedFile], archives: list[ScannedFile],
                            errors: list[tuple[str, str]]   # (rel_path or dir, reason)
 
     scan_library(cfg) -> ScanResult
         os.scandir recursion (size and mtime come from the directory listing on
         Windows: no per-file stat over SMB). Audio = config.AUDIO_EXTENSIONS,
-        archives = config.ARCHIVE_EXTENSIONS, matched case-insensitively. Everything
-        else is ignored. Skips hidden/system entries and never descends into the
-        quarantine folder. Unreadable directories become errors, not crashes.
+        archives = config.ARCHIVE_EXTENSIONS, matched case-insensitively. A .json file
+        is only ever an audio file's sidecar. Everything else is ignored. Skips
+        hidden/system entries and never descends into the quarantine folder. Unreadable
+        directories become errors, not crashes.
 
     classify_path(cfg, rel_path) -> tuple[str | None, str | None]   # (pack, category_path)
         Under a pack root: packs/<pack>/<a>/<b>/f.wav -> ("<pack>", "<a>/<b>").
@@ -34,6 +37,13 @@ CONTRACT:
         {cat_id, category, subcategory, fx_name, creator_id, source_id}.
         Recognize CatIDs from the official UCS list (bundle it as data); None if no match.
 
+    read_sidecar(cfg, rel_path) -> (dict | None, error: str | None)
+        Reads a sidecar (read-only, at most SIDECAR_MAX_BYTES). The JSON must be an
+        object; otherwise (None, why). Never raises for a bad or unreadable file.
+    sidecar_text(data: dict) -> str
+        The searchable words of a sidecar: the string (or list of strings) values of
+        SIDECAR_TEXT_KEYS, top level only, each capped like other metadata text.
+
     find_license(cfg, rel_path) -> str | None
         rel_path of the nearest ancestor-folder license file (LICENSE*, *licen[cs]e*.pdf/
         .txt/.md, "please read"), cached per folder; None if none up to the root.
@@ -51,6 +61,7 @@ Implementation notes (not contract):
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import stat
@@ -64,6 +75,10 @@ from pathlib import PurePosixPath
 from foley.config import ARCHIVE_EXTENSIONS, AUDIO_EXTENSIONS, Config
 
 METADATA_VERSION = "1"
+
+SIDECAR_EXT = ".json"
+SIDECAR_MAX_BYTES = 256 * 1024
+SIDECAR_TEXT_KEYS = ("title", "description", "prompt", "notes", "keywords")
 
 # Folder names that are never library content (NAS recycle bins, Synology/macOS metadata).
 _SKIP_DIRS = frozenset(
@@ -82,6 +97,7 @@ class ScannedFile:
     size_bytes: int
     mtime_ns: int
     ext: str
+    sidecar: ScannedFile | None = None
 
 
 @dataclass
@@ -123,6 +139,8 @@ def scan_library(cfg: Config) -> ScanResult:
         if quarantine and _norm(abs_dir) == quarantine:
             continue
         licenses: list[str] = []
+        here: list[ScannedFile] = []  # this folder's audio, for sidecar matching
+        sidecars: dict[str, ScannedFile] = {}
         try:
             with os.scandir(abs_dir) as it:
                 entries = list(it)
@@ -144,16 +162,56 @@ def scan_library(cfg: Config) -> ScanResult:
                     st = entry.stat()
                     item = ScannedFile(rel, st.st_size, st.st_mtime_ns, ext)
                     (result.audio if ext in AUDIO_EXTENSIONS else result.archives).append(item)
+                    if ext in AUDIO_EXTENSIONS:
+                        here.append(item)
+                elif ext == SIDECAR_EXT:
+                    st = entry.stat()
+                    stem = os.path.splitext(entry.name)[0].casefold()
+                    sidecars[stem] = ScannedFile(rel, st.st_size, st.st_mtime_ns, ext)
                 elif _license_rank(entry.name) is not None:
                     licenses.append(entry.name)
             except OSError as e:
                 result.errors.append((f"{rel_dir}/{entry.name}" if rel_dir else entry.name,
                                       f"cannot stat: {e}"))
         _LICENSE_CACHE[(root_key, rel_dir)] = _best_license(rel_dir, licenses)
+        if sidecars:
+            for item in here:
+                stem = PurePosixPath(item.rel_path).stem.casefold()
+                item.sidecar = sidecars.get(stem)
 
     result.audio.sort(key=lambda f: f.rel_path)
     result.archives.sort(key=lambda f: f.rel_path)
     return result
+
+
+# --------------------------------------------------------------------------- sidecars
+
+
+def read_sidecar(cfg: Config, rel_path: str) -> tuple[dict | None, str | None]:
+    path = os.path.join(os.fspath(cfg.library_root), *rel_path.split("/"))
+    try:
+        with open(path, "rb") as f:  # read-only: the library is never written
+            raw = f.read(SIDECAR_MAX_BYTES + 1)
+    except OSError as e:
+        return None, f"unreadable: {e}"
+    if len(raw) > SIDECAR_MAX_BYTES:
+        return None, f"larger than {SIDECAR_MAX_BYTES} bytes"
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as e:
+        return None, f"not valid JSON: {e}"
+    if not isinstance(data, dict):
+        return None, "not a JSON object"
+    return data, None
+
+
+def sidecar_text(data: dict) -> str:
+    parts: list[str] = []
+    for key in SIDECAR_TEXT_KEYS:
+        value = data.get(key)
+        values = value if isinstance(value, list) else [value]
+        parts += [v.strip()[:_MAX_TEXT] for v in values if isinstance(v, str) and v.strip()]
+    return " ".join(parts)
 
 
 def classify_path(cfg: Config, rel_path: str) -> tuple[str | None, str | None]:

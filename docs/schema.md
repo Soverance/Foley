@@ -15,7 +15,7 @@ Each file has a `meta` table whose `schema_version` row holds the applied migrat
 
 | File | Current version |
 | --- | --- |
-| `catalog.db` | 1 |
+| `catalog.db` | 2 |
 | `ledger.db` | 1 |
 
 ## Conventions
@@ -87,9 +87,23 @@ Tags and embeddings are filled in by `foley index` after an asset is already `ac
 
 `(asset_id, kind)` → `local_path` (relative to the data folder), `version`, `rendered_at`. Images are rendered on demand and cached, so a row may be absent.
 
+### sidecars
+
+Added in catalog version 2. One row per asset that has a sidecar: a `.json` file with the same name as the audio file, in the same folder (`foo.json` for `foo.wav`, names compared case-insensitively). Generation pipelines write one per file, recording the prompt, model and licence.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `asset_id` | INTEGER | Primary key, `assets.id` |
+| `rel_path` | TEXT | The sidecar file, relative to the library root |
+| `size_bytes`, `mtime_ns` | INTEGER | As listed on disk; a change makes `foley index` read it again |
+| `data` | TEXT (JSON) | The sidecar's JSON object, as read. NULL when it could not be read |
+| `error` | TEXT | Why it could not be read or parsed (not JSON, not an object, too large), else NULL |
+
+Its `title`, `description`, `prompt`, `notes` and `keywords` values (strings or lists of strings, top level) are added to the asset's `metadata` search column.
+
 ### search_fts
 
-FTS5 table whose `rowid` is `assets.id`. Columns: `name`, `pack`, `category`, `metadata`, `tags`, `caption`.
+FTS5 table whose `rowid` is `assets.id`. Columns: `name`, `pack`, `category`, `metadata` (embedded description fields plus the sidecar's text), `tags`, `caption`.
 
 ### asset_stages, index_runs, archives, meta
 

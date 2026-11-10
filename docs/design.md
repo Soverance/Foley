@@ -60,6 +60,8 @@ A Python indexer writes a local catalog. Three kinds of consumer read it: the MC
 
 ## The library is read-only
 
+**Licences that forbid passing files on.** Some sources, generated sound effects in particular, may be used inside a game but never distributed on their own or as part of a library. `[library] no_redistribute` names those folders. The MCP tools mark such files, and any feature that would hand library files to people outside the studio's own products (an export, a download bundle, a share link, a public server) must leave them out (`config.redistributable`). Importing into a configured game project is use, not distribution.
+
 Nothing in Foley writes to the library, with one planned exception: duplicate cleanup (see below), which goes through `nas_write.py`, runs only from the CLI and only when a person types it. Every other module opens library files read-only. `tests/test_readonly.py` enforces this with a runtime audit hook that fails on any write-intent open, rename, delete or subprocess aimed at the fixture library, from every entry point (index, MCP tools, browse endpoints, dedupe report).
 
 ## Library sync
@@ -78,6 +80,7 @@ Nothing in Foley writes to the library, with one planned exception: duplicate cl
 | Path gone | Mark it `missing` and keep the row, so decisions and usages stay valid |
 | Moved or renamed | Re-point the existing asset to the new path, keeping its analysis and decisions. Matched cheaply by name, size and time when unambiguous, otherwise by content hash |
 | Still being written (modified within `settle_minutes`, either side of now to absorb clock skew) | Skip it until a later run, listing it by name in the log; packs are often extracted in bulk. A modified time further in the future is the file's own date (zip entries store zone-less local time), so it is indexed, not held |
+| Sidecar (`<name>.json` beside `<name>.wav`) added, changed or removed | Read it (only it: the audio is not read again) and rebuild the file's search text. A sidecar that is not a JSON object is recorded with the error |
 | Archive (`.zip`, `.rar`, `.7z`) | Don't index it; report it under "archives not extracted" |
 | Decode failure | Mark it `error` with the reason, and retry on later runs |
 

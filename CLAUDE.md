@@ -11,6 +11,7 @@ Offline audio catalog + MCP server so Claude Code can search a sound library it 
 ## Rules
 
 - **Never write to the audio library** (the configured `library.root`, often a shared network drive). Only `src/foley/nas_write.py` may modify it, and only for `foley dedupe apply/restore/purge` run by a human. `tests/test_readonly.py` enforces this.
+- **Never add a way to hand library files outside the studio's own products** (export, download bundles, share links, a public server) that includes files for which `config.redistributable()` is False (`[library] no_redistribute`): their licences forbid distributing them on their own.
 - Both SQLite files are public contracts (other programs, such as a game engine's sound tool, read them directly). Schema changes go in a new numbered file under `src/foley/catalog/migrations/<catalog|ledger>/` and are documented in `docs/schema.md`. Never edit an applied migration.
 - `catalog.db` is derived and rebuildable; `ledger.db` (decisions, usages, dedupe log) is not. Ledger rows key on `content_hash`.
 - Keep the repo publishable (MIT): no site-specific values in code (everything via `foley.toml`), no audio, catalogs or model weights committed. Tests generate audio with `tests/audiogen.py`; the fixture library is in `tests/conftest.py`. Third-party code, fonts and data need an entry in `THIRD_PARTY_NOTICES.md`.

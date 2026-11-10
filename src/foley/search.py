@@ -6,7 +6,8 @@ CONTRACT:
 
     index_asset(conn, asset_id: int) -> None
         (Re)write the search_fts row (rowid = asset_id) from assets, source_metadata,
-        tags and caption. Filename words are split on _ - . space and camelCase, and
+        the asset's sidecar (scan.sidecar_text, in the metadata column), tags and
+        caption. Filename words are split on _ - . space and camelCase, and
         UCS category/subcategory names are added, so "GOREMisc_Cladding_NailScratch19"
         is findable by "gore", "cladding", "nail scratch".
 
@@ -76,7 +77,8 @@ CONTRACT:
         find_similar's ranking: hits = [(asset id, cosine)], duplicates kept.
 
     describe(conn, asset: int | str) -> dict
-        By id or rel_path. Full record: asset fields, parsed metadata, features,
+        By id or rel_path. Full record: asset fields, parsed metadata, "sidecar"
+        ({path, data, error} or None), features,
         tags, caption, image path (if cached), duplicate copies, and ledger
         decisions/usages for its content_hash.
 
@@ -259,6 +261,13 @@ def index_asset(conn: sqlite3.Connection, asset_id: int) -> None:
     ]
     category = " ".join(" ".join(name_tokens(b)) for b in category_bits if b)
     metadata = _metadata_text(meta)
+    sidecar = conn.execute("SELECT data FROM sidecars WHERE asset_id = ?",
+                           (asset_id,)).fetchone()
+    if sidecar is not None and sidecar[0]:
+        from foley import scan
+
+        metadata = " ".join(p for p in (metadata, scan.sidecar_text(_parse_json(sidecar[0])))
+                            if p)
     tag_rows = conn.execute(
         "SELECT label FROM tags WHERE asset_id = ? ORDER BY score DESC", (asset_id,)
     ).fetchall()
@@ -885,6 +894,15 @@ def _data_dir(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+def _sidecar(conn: sqlite3.Connection, asset_id: int) -> dict | None:
+    row = conn.execute("SELECT rel_path, data, error FROM sidecars WHERE asset_id = ?",
+                       (asset_id,)).fetchone()
+    if row is None:
+        return None
+    return {"path": row["rel_path"], "data": _parse_json(row["data"]) if row["data"] else None,
+            "error": row["error"]}
+
+
 def describe(conn: sqlite3.Connection, asset: int | str) -> dict:
     if isinstance(asset, str) and asset.strip().isdigit():
         asset = int(asset)
@@ -914,6 +932,7 @@ def describe(conn: sqlite3.Connection, asset: int | str) -> dict:
         "missing_since": row["missing_since"],
         "indexed_at": row["indexed_at"],
         "metadata": _parse_json(row["source_metadata"]),
+        "sidecar": _sidecar(conn, aid),
     }
     feat = conn.execute("SELECT * FROM features WHERE asset_id = ?", (aid,)).fetchone()
     features = None

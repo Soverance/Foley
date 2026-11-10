@@ -14,6 +14,15 @@ shared server"): enabled (bool, default false) -> cfg.mcp_enabled; project_roots
 folder paths) -> cfg.mcp_project_roots, the only folders `import_to_project` may write
 under when called through that endpoint. in_project_roots(cfg, path) -> bool tells whether
 a path lies in (or is) one of them, comparing real, case-normalized paths.
+
+[library] no_redistribute (list of library-relative folders, default empty) ->
+cfg.no_redistribute: files whose licence allows use only inside a product, never
+distribution on their own (for example sound-effect services whose terms forbid passing
+the files on standalone or as part of a library). redistributable(cfg, rel_path) -> bool
+is False for a file in (or under) one of them, compared case-insensitively by whole path
+segments. Any feature that hands library files to people outside the studio's own
+products (export, download bundles, sharing links, a public server) must leave out every
+file for which it is False.
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ class Config:
     data_dir: Path = field(default_factory=default_data_dir)
     pack_roots: list[str] = field(default_factory=lambda: ["packs"])
     settle_minutes: float = 10.0
+    no_redistribute: list[str] = field(default_factory=list)
     prune_missing_days: float = 30.0
     quarantine_root: Path | None = None
     dedupe_retention_days: float = 30.0
@@ -148,6 +158,12 @@ def from_dict(data: dict, source: Path | None = None) -> Config:
         cfg.data_dir = Path(storage["data_dir"])
     cfg.pack_roots = list(library.get("pack_roots", cfg.pack_roots))
     cfg.settle_minutes = float(library.get("settle_minutes", cfg.settle_minutes))
+    no_redist = library.get("no_redistribute", [])
+    if not isinstance(no_redist, list) or not all(
+            isinstance(d, str) and d.strip() for d in no_redist):
+        raise ConfigError("library.no_redistribute must be a list of library-relative "
+                          "folder paths")
+    cfg.no_redistribute = [d.strip() for d in no_redist]
     cfg.prune_missing_days = float(prune.get("missing_days", cfg.prune_missing_days))
     cfg.quarantine_root = _path(dedupe.get("quarantine_root"))
     cfg.dedupe_retention_days = float(dedupe.get("retention_days", cfg.dedupe_retention_days))
@@ -237,6 +253,20 @@ def _mcp(cfg: Config, mcp: dict) -> None:
 def in_project_roots(cfg: Config, path: Path) -> bool:
     """Whether `path` is one of [mcp] project_roots or lies inside one."""
     return any(_inside(Path(path), root) for root in cfg.mcp_project_roots)
+
+
+def _segments(rel_path: str) -> list[str]:
+    return [p.casefold() for p in rel_path.replace("\\", "/").split("/") if p and p != "."]
+
+
+def redistributable(cfg: Config, rel_path: str) -> bool:
+    """False when `rel_path` lies in (or under) one of [library] no_redistribute."""
+    parts = _segments(rel_path)
+    for folder in cfg.no_redistribute:
+        prefix = _segments(folder)
+        if prefix and parts[: len(prefix)] == prefix:
+            return False
+    return True
 
 
 def _inside(child: Path, parent: Path) -> bool:

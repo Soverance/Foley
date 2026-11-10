@@ -12,6 +12,10 @@ root = "//nas.example.local/Assets/Audio"
 # Outside a pack root, pack is empty and category_path is the whole folder path.
 pack_roots = ["packs"]
 
+# Folders whose files may be used only inside your own products, never passed on by
+# themselves (some generation services' sound-effect terms). Flagged in MCP results.
+# no_redistribute = ["generated/elevenlabs"]
+
 # Files modified more recently than this are skipped until a later run
 # (they may still be copying or extracting).
 settle_minutes = 10

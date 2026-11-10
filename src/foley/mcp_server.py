@@ -24,6 +24,11 @@ CONTRACT (Phase 1 tools; Phase 2 adds the ledger tools):
                                          first (browse.shortlist_items over shortlist.json);
                                          id is null when no catalog row has that file any more
 
+    Every result item that names a library file (search and find_similar results,
+    describe, get_shortlist items, import_to_project) gets "no_redistribute": true when
+    config.redistributable() is False for it: the file may be used only inside a game,
+    never passed on by itself. The key is absent otherwise.
+
     Results are compact JSON. Tool descriptions are written for Claude: say what each
     returns and when to use it. Config comes from foley.config.load() (FOLEY_CONFIG
     env or default locations). No tool may modify the library.
@@ -74,6 +79,8 @@ INSTRUCTIONS = (
     "envelope), "
     "import_to_project. get_shortlist returns the sounds the user starred after listening in "
     "`foley browse`. Durations are in seconds, loudness in LUFS, peaks in dBTP. "
+    "A result marked no_redistribute: true may be used only inside the game, combined with "
+    "other material: never copy that file anywhere else on its own. "
     "No tool modifies the audio library."
 )
 
@@ -148,6 +155,25 @@ def _fail(e: Exception) -> ToolError:
 # ----------------------------------------------------------------------------- tools
 
 
+NO_REDISTRIBUTE_NOTE = (
+    "licence: this file may be used only inside the game, combined with other material; "
+    "never distribute, share or publish it on its own"
+)
+
+
+def _flag(item: dict) -> dict:
+    path = item.get("path")
+    if isinstance(path, str) and not config_mod.redistributable(get_config(), path):
+        item["no_redistribute"] = True
+    return item
+
+
+def _flag_results(result: dict) -> dict:
+    for item in result.get("results") or []:
+        _flag(item)
+    return result
+
+
 def _settings():
     from foley import search
 
@@ -182,10 +208,10 @@ def tool_search_audio(
             min_attack_s=min_attack_s,
             max_attack_s=max_attack_s,
         )
-        return search.search(
+        return _flag_results(search.search(
             get_conn(), query, filters, project=project, limit=max(1, min(int(limit), 100)),
             settings=_settings(),
-        )
+        ))
     except Exception as e:  # noqa: BLE001
         raise _fail(e) from e
 
@@ -213,10 +239,10 @@ def tool_find_similar(
             min_lufs=min_lufs, max_lufs=max_lufs,
             min_attack_s=min_attack_s, max_attack_s=max_attack_s,
         )
-        return search.find_similar(
+        return _flag_results(search.find_similar(
             get_conn(), int(asset_id), filters, limit=max(1, min(int(limit), 100)),
             project=project, settings=_settings(),
-        )
+        ))
     except LookupError as e:
         raise ToolError(f"no such asset: {asset_id}") from e
     except Exception as e:  # noqa: BLE001
@@ -227,7 +253,7 @@ def tool_describe(asset: int | str) -> dict:
     from foley import search
 
     try:
-        return search.describe(get_conn(), asset)
+        return _flag(search.describe(get_conn(), asset))
     except Exception as e:  # noqa: BLE001
         raise _fail(e) from e
 
@@ -285,7 +311,7 @@ def tool_import_to_project(
                     f"project_roots of its foley.toml (currently: {roots}); {project_root} is "
                     "not under any of them. Ask the person running the Foley server to add it."
                 )
-        return importer.import_to_project(
+        result = importer.import_to_project(
             get_config(),
             get_conn(),
             int(asset_id),
@@ -295,6 +321,12 @@ def tool_import_to_project(
             target_lufs=target_lufs,
             overwrite=overwrite,
         )
+        row = get_conn().execute("SELECT rel_path FROM assets WHERE id = ?",
+                                 (int(asset_id),)).fetchone()
+        if row is not None and not config_mod.redistributable(get_config(), row[0]):
+            result["no_redistribute"] = True
+            result.setdefault("warnings", []).append(NO_REDISTRIBUTE_NOTE)
+        return result
     except Exception as e:  # noqa: BLE001
         raise _fail(e) from e
 
@@ -317,7 +349,7 @@ def tool_get_shortlist() -> dict:
             data = browse.load_shortlist(cfg)
         except ValueError as e:
             raise ToolError(f"the shortlist file is unreadable: {e}") from e
-        items = browse.shortlist_items(get_conn(), data)
+        items = [_flag(i) for i in browse.shortlist_items(get_conn(), data)]
         return {"count": len(items), "items": items}
     except Exception as e:  # noqa: BLE001
         raise _fail(e) from e

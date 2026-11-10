@@ -22,8 +22,9 @@ Paths can use forward slashes on Windows (`C:/Users/me/...`). A bad value stops 
 | `root` | (required) | Root of the audio library. A UNC path (`//nas.example.local/Audio`), a mapped drive or a local folder. Every catalog path is stored relative to it, so a UNC path and a drive letter for the same share are interchangeable. Foley only reads from here. |
 | `pack_roots` | `["packs"]` | Folders directly under the root whose children are packs. For `packs/<pack>/<a>/<b>/file.wav`, the pack is `<pack>` and the category path `<a>/<b>`. Outside a pack root the pack is empty and the category path is the whole folder. Search can filter on both. |
 | `settle_minutes` | `10` | Files modified more recently than this (or dated less than this in the future, for clock skew) are skipped until a later run, since they may still be copying or extracting. The scan log lists them by name. |
+| `no_redistribute` | `[]` | Library-relative folders whose files may be used only inside your own products, never passed on by themselves. Some generation services' terms say this for their sound effects. The MCP tools mark these files `"no_redistribute": true`, and `import_to_project` adds a licence warning. Foley has no export or sharing feature; any added later must leave these files out. Example: `["generated/elevenlabs"]`. |
 
-Audio extensions indexed: `.wav .flac .ogg .mp3 .aif .aiff`. Archives (`.zip .rar .7z`) are counted, never opened: `foley status` lists the ones without an extracted folder next to them.
+Audio extensions indexed: `.wav .flac .ogg .mp3 .aif .aiff`. A `.json` file with the same name as an audio file in the same folder is that file's sidecar: its `prompt`, `notes`, `title`, `description` and `keywords` become searchable (see [schema.md](schema.md#sidecars)). Archives (`.zip .rar .7z`) are counted, never opened: `foley status` lists the ones without an extracted folder next to them.
 
 ## `[storage]`
 

@@ -56,6 +56,11 @@ CONTRACT:
         run interrupted and the next run resumes. `stages` limits which stages run
         (re-run those even if current when force=True). `limit` caps files analyzed
         (for trial runs).
+        Sidecars (scan.ScannedFile.sidecar): during the scan diff, a present, settled
+        asset whose sidecar (rel_path, size, mtime) differs from its `sidecars` row has
+        the sidecar read (scan.read_sidecar), the row replaced (or deleted when the
+        sidecar is gone) and its "fts" stage record dropped, so only fts re-runs: no
+        audio read. A sidecar that cannot be read or parsed is stored with its error.
         Raises LibraryUnavailable (run recorded as 'failed', nothing marked missing)
         when the root cannot be listed, when the scan would mark more than
         MASS_MISSING_FRACTION (10%) of active assets and at least MASS_MISSING_MIN (50)
@@ -768,16 +773,72 @@ def _sync(cfg, conn, summary: RunSummary, requested, force, prog: _Progress,
                 "UPDATE assets SET status='active', error=NULL, "
                 "indexed_at=coalesce(indexed_at, ?) WHERE id=?", (now, aid)
             )
+    sidecars_read = _sync_sidecars(cfg, conn, result.audio, stage_map, settling, gone_ids)
+    if sidecars_read:
+        # assets whose sidecar changed: make sure the fts re-run is queued
+        queued = {w.asset_id: w for w in work}
+        for f in result.audio:
+            row = by_path.get(f.rel_path)
+            if row is None or settling(f) or row["id"] in gone_ids or "fts" not in requested:
+                continue
+            done = stage_map.get(row["id"], {})
+            if stage_current("fts", done.get("fts"), versions):
+                continue
+            if row["id"] in queued:
+                queued[row["id"]].needed.add("fts")
+            else:
+                needed = {s for s in requested
+                          if force or not stage_current(s, done.get(s), versions)}
+                work.append(_Work(row["id"], f.rel_path, needed, False))
     work.sort(key=lambda w: w.rel_path)
     prog.say(
         f"scanned {summary.scanned} audio files in {time.monotonic() - t0:.1f}s: "
         f"{summary.added} new, {summary.changed} changed, "
         + (f"{len(renamed)} moved (renamed, no reads), " if renamed else "")
         + f"{summary.missing} missing, {summary.settling} settling, "
-        f"{summary.archives} archives; {len(work)} to analyze"
+        f"{summary.archives} archives; "
+        + (f"{sidecars_read} sidecars read; " if sidecars_read else "")
+        + f"{len(work)} to analyze"
     )
     _say_settling(prog, settling_files, now_ns, settle_ns)
     return work, result.errors, gone_ids
+
+
+def _sync_sidecars(cfg, conn, files, stage_map, settling, gone_ids) -> int:
+    """Bring the sidecars table in line with the scan; returns how many changed."""
+    stored = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+        "SELECT asset_id, rel_path, size_bytes, mtime_ns FROM sidecars")}
+    ids = {r[1]: r[0] for r in conn.execute("SELECT id, rel_path FROM assets")}
+    changes = []
+    for f in files:
+        aid = ids.get(f.rel_path)
+        if aid is None or aid in gone_ids or settling(f):
+            continue
+        sc = f.sidecar
+        want = (sc.rel_path, sc.size_bytes, sc.mtime_ns) if sc is not None else None
+        if stored.get(aid) != want:
+            changes.append((aid, sc))
+    if not changes:
+        return 0
+    # NAS reads happen outside the write transaction
+    read = [(aid, sc, *(scan.read_sidecar(cfg, sc.rel_path) if sc is not None else (None, None)))
+            for aid, sc in changes]
+    with db.transaction(conn):
+        for aid, sc, data, error in read:
+            if sc is None:
+                conn.execute("DELETE FROM sidecars WHERE asset_id=?", (aid,))
+            else:
+                conn.execute(
+                    "INSERT INTO sidecars(asset_id, rel_path, size_bytes, mtime_ns, data, error) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(asset_id) DO UPDATE SET "
+                    "rel_path=excluded.rel_path, size_bytes=excluded.size_bytes, "
+                    "mtime_ns=excluded.mtime_ns, data=excluded.data, error=excluded.error",
+                    (aid, sc.rel_path, sc.size_bytes, sc.mtime_ns,
+                     None if data is None else json.dumps(data, ensure_ascii=False), error),
+                )
+            conn.execute("DELETE FROM asset_stages WHERE asset_id=? AND stage='fts'", (aid,))
+            stage_map.get(aid, {}).pop("fts", None)
+    return len(read)
 
 
 def _say_settling(prog, files: list[scan.ScannedFile], now_ns: int, settle_ns: int) -> None:

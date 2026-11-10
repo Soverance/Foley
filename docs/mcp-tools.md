@@ -130,7 +130,7 @@ The full record for one file.
 | --- | --- | --- |
 | `asset` | int or string | Asset id or library-relative path. |
 
-Returns asset fields, parsed embedded metadata (BWF, iXML, ID3), measured features (duration, sample rate, channels, integrated and short-term loudness, true peak, attack, decay, onsets, spectral centroid and rolloff, flatness, band energy, tempo, loop seam), tags with scores, the caption, the cached image path, exact duplicate copies, and past decisions and project usages from the ledger. It is larger than a search result; use it for a shortlisted candidate.
+Returns asset fields, parsed embedded metadata (BWF, iXML, ID3), measured features (duration, sample rate, channels, integrated and short-term loudness, true peak, attack, decay, onsets, spectral centroid and rolloff, flatness, band energy, tempo, loop seam), tags with scores, the caption, the cached image path, exact duplicate copies, and past decisions and project usages from the ledger. It also returns `sidecar`: `{path, data, error}` for a file with a `.json` sidecar (a generation record with the prompt, model and licence), else `null`. It is larger than a search result; use it for a shortlisted candidate.
 
 ## `render_comparison`
 
@@ -172,7 +172,7 @@ Normalization:
 - WAV, FLAC and AIFF are written normalized in their own format and bit depth (`gain_applied: true`).
 - MP3 and OGG are copied unmodified, to avoid a second lossy encode: apply the returned `gain_db` in the engine (for Godot, `volume_db`).
 
-Returns `{project_path, gain_db, gain_applied, normalized_to_lufs, capped, license, warnings}`. Without a target, the file is copied as is. See [configuration.md](configuration.md#per-project-settings-foleyprojecttoml) for `foley.project.toml`.
+Returns `{project_path, gain_db, gain_applied, normalized_to_lufs, capped, license, warnings}`, plus `no_redistribute: true` and a licence warning for a file under `[library] no_redistribute`. Without a target, the file is copied as is. See [configuration.md](configuration.md#per-project-settings-foleyprojecttoml) for `foley.project.toml`.
 
 ## `catalog_status`
 
@@ -181,6 +181,10 @@ No inputs. Returns catalog health: asset counts by status, the last scan and how
 ## `get_shortlist`
 
 No inputs. Returns `{"count": n, "items": [...]}`: the sounds a person starred in `foley browse`, newest first. Each item has `id` (null if the file is no longer in the catalog), `path`, `note` (often the intended use, such as "for the boss arena intro?"), `caption`, `duration_s`, `lufs`, `content_hash`, `added_at` and `status`. Stars are keyed by file content, so they survive moves and renames.
+
+## Files that must not be passed on
+
+Every result that names a library file (search and `find_similar` results, `describe`, shortlist items, `import_to_project`) carries `"no_redistribute": true` when the file lies under `[library] no_redistribute`. Such a file may be used inside the game, combined with other material, but never copied anywhere else on its own: not into a sound library, a shared folder, a release of raw assets or a public repository. The key is absent for other files.
 
 ## Errors
 
