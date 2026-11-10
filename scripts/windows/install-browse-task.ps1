@@ -10,11 +10,12 @@
     icon. The task runs under your normal logon, so it reaches a NAS share with your
     own credentials: no stored password and no admin rights needed.
 
-    The task also repeats every five minutes, which brings Foley back if it was killed.
-    The tray holds a single-instance lock, so a repeat while it runs exits at once. The
-    tray restarts itself on the base Python interpreter, so that it and the server are
-    one process each, and the task's own run then ends: Task Scheduler shows the task
-    as "Ready", not "Running", while Foley runs. Look for the tray icon, or for
+    It also adds "Foley" to the Start Menu, to start Foley again after Quit; choosing it
+    while Foley runs opens Foley in the browser. Only one tray runs at a time.
+
+    The tray restarts itself on the base Python interpreter, so that it and the server
+    are one process each, and the task's own run then ends: Task Scheduler shows the
+    task as "Ready", not "Running", while Foley runs. Look for the tray icon, or for
     `-m foley.cli tray` in Task Manager's command lines, instead. Installing or
     uninstalling stops a running tray for this log file (its server stops with it).
 
@@ -26,8 +27,8 @@
 
 .EXAMPLE
     .\scripts\windows\install-browse-task.ps1              # install (or update) and start now
-    .\scripts\windows\install-browse-task.ps1 -Headless    # no tray icon
-    .\scripts\windows\install-browse-task.ps1 -Uninstall   # stop and remove
+    .\scripts\windows\install-browse-task.ps1 -Headless    # no tray icon (and no shortcut)
+    .\scripts\windows\install-browse-task.ps1 -Uninstall   # stop and remove both
 #>
 [CmdletBinding()]
 param(
@@ -42,6 +43,8 @@ param(
     [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
+
+$shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Foley.lnk'
 
 # The tray runs outside the task once it has restarted itself (see above), so stopping
 # the task does not stop it. Stopping the tray closes the server's standard input, and
@@ -66,6 +69,10 @@ if ($Uninstall) {
     } else {
         Write-Host "No task named '$TaskName'."
     }
+    if (Test-Path $shortcut) {
+        Remove-Item $shortcut
+        Write-Host "Removed the Start Menu shortcut."
+    }
     return
 }
 
@@ -88,10 +95,6 @@ $user = "$env:USERDOMAIN\$env:USERNAME"
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument ($arguments -join ' ') `
     -WorkingDirectory $env:LOCALAPPDATA  # not the repo: a stray ./foley.toml there must not win
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-# Repeat every five minutes for as long as the session lasts (no duration = indefinitely).
-$trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
-$trigger.Repetition.StopAtDurationEnd = $false  # never stop a running Foley
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
@@ -102,7 +105,25 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force `
     -Description "Foley library browser ($(if ($Headless) { 'foley browse' } else { 'foley tray' })) from $repo. Log: $LogFile" | Out-Null
-Write-Host "Registered task '$TaskName' (at logon of $user, then every 5 minutes)."
+Write-Host "Registered task '$TaskName' (at logon of $user)."
+
+if (-not $Headless) {
+    # Same command as the task, plus --open: start Foley, or show the running one.
+    $icon = Join-Path (Split-Path $LogFile) 'foley.ico'
+    $iconArgs = @('-m', 'foley.cli')
+    if ($Config) { $iconArgs += @('--config', (Resolve-Path $Config).Path) }
+    & (Join-Path $repo '.venv\Scripts\python.exe') @iconArgs tray --save-icon $icon | Out-Null
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    $lnk.TargetPath = $pythonw
+    $lnk.Arguments = (($arguments + '--open') -join ' ')
+    $lnk.WorkingDirectory = $env:LOCALAPPDATA
+    $lnk.Description = 'Foley sound library browser'
+    if (Test-Path $icon) { $lnk.IconLocation = "$icon,0" }
+    $lnk.Save()
+    Write-Host "Added 'Foley' to the Start Menu."
+} elseif (Test-Path $shortcut) {
+    Remove-Item $shortcut  # a headless server has no tray to start
+}
 
 if (-not $NoStart) {
     Stop-ScheduledTask -TaskName $TaskName  # a headless server still runs inside the task

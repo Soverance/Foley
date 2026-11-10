@@ -234,7 +234,10 @@ def cmd_browse(cfg, args) -> int:
 def cmd_tray(cfg, args) -> int:
     from foley import tray
 
-    return tray.run(cfg, log_file=args.log_file)
+    if args.save_icon:
+        print(tray.save_icon(cfg, args.save_icon))
+        return 0
+    return tray.run(cfg, log_file=args.log_file, open_browser=args.open)
 
 
 def cmd_mcp_token(cfg, args) -> int:
@@ -339,6 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--log-file", metavar="PATH",
                    help="the server's log (default <data dir>/logs/browse.log); the tray "
                    "logs to tray.log beside it")
+    s.add_argument("--open", action="store_true",
+                   help="open Foley in the browser once the server is up, or at once if "
+                   "a tray is already running")
+    s.add_argument("--save-icon", metavar="PATH",
+                   help="write the icon as an .ico file and exit (for shortcuts)")
     s.set_defaults(func=cmd_tray)
 
     s = sub.add_parser("mcp", help="the shared MCP endpoint that foley browse serves at /mcp")

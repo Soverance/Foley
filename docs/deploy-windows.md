@@ -52,13 +52,13 @@ Read the licence and security notes in [browse.md](browse.md#serving-it-on-your-
 .\scripts\windows\install-browse-task.ps1
 ```
 
-This registers a Task Scheduler task, **Foley Browser**, for the current user that runs `foley tray` with the repo's own `.venv\Scripts\pythonw.exe` (no console window) at logon, and starts it now. `foley tray` puts a Foley icon in the notification area and runs the server as a child process (see [The tray icon](#the-tray-icon)).
+This registers a Task Scheduler task, **Foley Browser**, for the current user that runs `foley tray` with the repo's own `.venv\Scripts\pythonw.exe` (no console window) at logon, and starts it now. `foley tray` puts a Foley icon in the notification area and runs the server as a child process (see [The tray icon](#the-tray-icon)). It also adds **Foley** to the Start Menu: choose it to start Foley again after **Quit**, or, while Foley runs, to open it in the browser.
 
 A venv's `pythonw.exe` is only a launcher that starts the real interpreter as a second process. To avoid that, the tray starts a copy of itself directly on the real interpreter and exits, and starts the server the same way. The machine then runs exactly two Foley processes: the tray and the server. Task Manager calls them both "Python"; the Details tab's **Command line** column shows `-m foley.cli tray` and `-m foley.cli browse`. Because the task's own run ends right away, the task shows **Ready**, not Running, while Foley runs.
 
 The task:
 
-- repeats every 5 minutes. A run that finds the tray alive exits at once without logging anything, and a run that finds it gone (killed, or crashed) starts it again. The tray itself restarts a crashed server, up to 5 times in 10 minutes;
+- runs once per logon. The tray restarts a crashed server, up to 5 times in 10 minutes; if the tray itself is gone, start Foley from the Start Menu;
 - has no time limit and runs on battery;
 - starts in `%LOCALAPPDATA%`, not the repo, so a stray `foley.toml` in the checkout cannot take over;
 - logs to `%LOCALAPPDATA%\Foley\logs\browse.log` (size-rotated), and the tray to `tray.log` beside it.
@@ -86,7 +86,7 @@ Right-click the Foley icon in the notification area (it may be under the **^** o
 | **Restart server** | Stops the server cleanly (a running scan is stopped first) and starts a fresh one, which loads the current code and `foley.toml`. |
 | **Stop server** / **Start server** | Stops the server and leaves it stopped, for example while you update. |
 | **Open log** | Opens `browse.log`. |
-| **Quit** | Stops the server and removes the icon. The task's next 5-minute run starts them again; to keep Foley stopped, disable the task (`Disable-ScheduledTask -TaskName 'Foley Browser'`) or uninstall it. |
+| **Quit** | Stops the server and removes the icon. Foley stays stopped until you start it from the Start Menu or log on again. |
 
 The dot on the icon shows the state: green running, blue scanning, amber starting or stopping, grey stopped, red failed (the server stopped 5 times in 10 minutes; the log says why). Hover for the address or the scan's progress. The icon uses `logo.png` from `[browse] brand_dir` when there is one. Only one tray runs per data folder.
 
@@ -130,7 +130,7 @@ Each person who uses Claude Code sets it once as a user environment variable (`s
 
 - **Sleep:** a sleeping machine serves nothing and misses scans. Set the power plan to never sleep when plugged in, or at least to stay awake overnight. Catch-up covers a missed slot, but only after the next start.
 - **Logon:** the task starts at *your* logon. If the machine reboots for updates, the server is down until someone logs on. Enable automatic sign-in on a dedicated machine, or accept the gap.
-- **Updates:** after a `git pull` that changes only Foley's Python code, choose **Restart server**. When dependencies changed (`uv.lock`), or `src/foley/tray.py` itself: `Disable-ScheduledTask -TaskName 'Foley Browser'`, choose **Quit**, run `uv sync --extra models` (it fails while Foley holds files in `.venv`), then `Enable-ScheduledTask` and `Start-ScheduledTask -TaskName 'Foley Browser'`. `Stop-ScheduledTask` no longer stops Foley, because the tray runs outside the task once started.
+- **Updates:** after a `git pull` that changes only Foley's Python code, choose **Restart server**. When dependencies changed (`uv.lock`), or `src/foley/tray.py` itself: choose **Quit**, run `uv sync --extra models` (it fails while Foley holds files in `.venv`), then start **Foley** from the Start Menu. `Stop-ScheduledTask` does not stop Foley, because the tray runs outside the task once started.
 
 ## Checking on it
 

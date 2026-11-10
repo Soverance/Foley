@@ -409,14 +409,15 @@ def test_run_relaunches_and_leaves_the_lock_to_the_copy(tmp_path, monkeypatch):
     monkeypatch.setattr(tray, "should_relaunch", lambda: True)
     lock_path = cfg.data_dir / tray.LOCK_FILE
 
-    def relaunch(cfg_, log_file):
+    def relaunch(cfg_, log_file, open_browser=False):
+        assert open_browser
         copy = tray._InstanceLock(lock_path)  # the copy can take the lock now
         assert copy.acquire()
         copy.release()
         return 99
 
     monkeypatch.setattr(tray, "relaunch", relaunch)
-    assert tray.run(cfg, tmp_path / "b.log") == 0
+    assert tray.run(cfg, tmp_path / "b.log", open_browser=True) == 0
 
 
 def test_run_carries_on_itself_when_the_copy_cannot_start(tmp_path, monkeypatch):
@@ -424,9 +425,87 @@ def test_run_carries_on_itself_when_the_copy_cannot_start(tmp_path, monkeypatch)
     monkeypatch.setattr(tray, "configure_logging", lambda path: None)
     monkeypatch.setattr(tray, "should_relaunch", lambda: True)
 
-    def relaunch(*_):
+    def relaunch(*_, **__):
         raise OSError("nope")
 
     monkeypatch.setattr(tray, "relaunch", relaunch)
     _no_pystray(monkeypatch)
     assert tray.run(cfg, tmp_path / "b.log") == 2  # got as far as loading pystray
+
+
+# ------------------------------------------------------------- start menu / --open
+
+
+def test_tray_command_passes_open_on(venv, tmp_path):
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    assert tray.tray_command(cfg, "b.log")[-1] == "b.log"
+    assert tray.tray_command(cfg, "b.log", open_browser=True)[-2:] == ["b.log", "--open"]
+    calls = []
+    tray.relaunch(cfg, "b.log", popen=lambda cmd, **kw: calls.append(cmd) or FakeProc(),
+                  open_browser=True)
+    assert calls[0][-1] == "--open"
+
+
+def test_starting_again_opens_the_running_foley(tmp_path, monkeypatch):
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    monkeypatch.setattr(tray, "configure_logging", lambda path: None)
+    opened = []
+    monkeypatch.setattr(tray.webbrowser, "open", opened.append)
+    holder = tray._InstanceLock(cfg.data_dir / tray.LOCK_FILE)
+    assert holder.acquire()
+    try:
+        assert tray.run(cfg, tmp_path / "b.log") == 0
+        assert opened == []  # the logon task: nothing to show
+        assert tray.run(cfg, tmp_path / "b.log", open_browser=True) == 0
+        assert opened == [tray.local_url(cfg)]
+    finally:
+        holder.release()
+
+
+def test_open_waits_until_the_server_answers(tmp_path, monkeypatch):
+    class Fake:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    class FakePystray:
+        Icon = Fake
+        MenuItem = Fake
+
+        class Menu(Fake):
+            SEPARATOR = None
+
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    opened = []
+    monkeypatch.setattr(tray.webbrowser, "open", opened.append)
+    app = tray._TrayApp(cfg, tmp_path / "b.log", FakePystray, open_browser=True)
+    app.supervisor = type("S", (), {"poll": lambda self: "running"})()
+    answers = iter([None, {"scan": {"running": False}}, {"scan": {"running": False}}])
+    app._fetch_status = lambda: next(answers)
+    app.refresh()
+    assert opened == []  # still starting
+    app.refresh()
+    app.refresh()
+    assert opened == [app.url]  # once
+
+
+def test_save_icon_writes_an_ico_without_a_status_dot(tmp_path):
+    from PIL import Image
+
+    cfg = Config(library_root=tmp_path, data_dir=tmp_path / "data")
+    path = tray.save_icon(cfg, tmp_path / "icons" / "foley.ico")
+    with Image.open(path) as ico:
+        assert ico.format == "ICO" and (256, 256) in ico.info["sizes"]
+    plain, dotted = tray.render_icon(None), tray.render_icon("running")
+    assert plain.getpixel((51, 51)) != dotted.getpixel((51, 51))
+
+
+def test_cli_save_icon(cfg, tmp_path, monkeypatch, capsys):
+    from foley import cli, config
+
+    monkeypatch.setattr(config, "load", lambda explicit=None: cfg)
+    monkeypatch.setattr(tray, "configure_logging", lambda path: None)
+    assert cli.main(["tray", "--save-icon", str(tmp_path / "f.ico")]) == 0
+    assert (tmp_path / "f.ico").is_file()

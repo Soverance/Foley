@@ -2,18 +2,20 @@
 
 CONTRACT:
 
-    run(cfg, log_file=None) -> int
+    run(cfg, log_file=None, open_browser=False) -> int
         Takes the single-instance lock (data_dir/tray.lock). If another tray holds it,
-        returns 0 at once without relaunching or writing to the log (the logon task
-        repeats every few minutes, so this is the normal case, not an error); a console
-        gets a one-line note on stderr. Then, if should_relaunch(), it releases the
-        lock, starts a detached copy of itself on the base interpreter (relaunch()) and
-        returns 0, so the venv launcher that started it exits too; the copy takes the
-        lock for real (a run that slips in between races the copy for the lock and one
-        of them exits quietly, so there is still one tray). If the copy cannot start it carries
-        on itself. Otherwise it starts `foley browse` as a child process (Supervisor) and
-        shows the icon until Quit, which stops the child cleanly and returns 0. Returns 2 when
-        pystray cannot load. The menu: Open Foley (the default item, on click), Scan now
+        returns 0 at once without relaunching (a console gets a one-line note on stderr);
+        with open_browser it first opens local_url() in the browser, so starting Foley
+        again (the Start Menu shortcut) shows the running one. Then, if
+        should_relaunch(), it releases the lock, starts a detached copy of itself on the
+        base interpreter (relaunch(), passing open_browser on) and returns 0, so the venv
+        launcher that started it exits too; the copy takes the lock for real (a run that
+        slips in between races the copy for the lock and one of them exits quietly, so
+        there is still one tray). If the copy cannot start it carries on itself.
+        Otherwise it starts `foley browse` as a child process (Supervisor) and shows the
+        icon until Quit, which stops the child cleanly and returns 0; with open_browser
+        it opens the browser once the server first answers. Returns 2 when pystray
+        cannot load. The menu: Open Foley (the default item, on click), Scan now
         or Stop scan, Restart server, Stop server or Start server, Open log, Quit.
         Restart starts a fresh Python process, so it picks up code changes in the
         checkout. Changes to dependencies or to this module need the tray itself
@@ -35,14 +37,15 @@ CONTRACT:
         __PYVENV_LAUNCHER__=exe gives the same venv in one process. Returns (base, exe)
         on Windows inside a venv when that base interpreter exists, else (exe, None):
         run exe as it is.
-    tray_command(cfg, log_file) -> list[str]
+    tray_command(cfg, log_file, open_browser=False) -> list[str]
         [pythonw, "-m", "foley.cli", ("--config", cfg.source), "tray", "--log-file",
-         log_file]: the relaunched copy, on the base pythonw.exe when there is one.
+         log_file, ("--open")]: the relaunched copy, on the base pythonw.exe when there
+         is one.
     should_relaunch() -> bool
         True on Windows when this process runs in a venv through a launcher that
         direct_interpreter() can bypass, unless it is itself the relaunched copy
         (RELAUNCHED_ENV set). Never elsewhere.
-    relaunch(cfg, log_file, popen=subprocess.Popen) -> int
+    relaunch(cfg, log_file, popen=subprocess.Popen, open_browser=False) -> int
         Starts tray_command() detached (no console, its own process group, out of the
         caller's job when the job allows it, no inherited handles), with
         __PYVENV_LAUNCHER__ and RELAUNCHED_ENV=1 set; returns its pid. Raises OSError
@@ -79,7 +82,10 @@ CONTRACT:
     tooltip(state, url, status=None) -> str      at most 127 characters (Windows' limit)
     render_icon(state, logo=None, size=64) -> PIL.Image (RGBA)
         logo.png from [browse] brand_dir when present, else a drawn mark, with a status
-        dot in the corner.
+        dot in the corner (none when state is None).
+    save_icon(cfg, path) -> Path
+        Writes the icon without a status dot as a multi-size .ico (for the Start Menu
+        shortcut that scripts/windows/install-browse-task.ps1 creates).
 """
 
 from __future__ import annotations
@@ -230,9 +236,11 @@ def browse_env() -> dict[str, str]:
     return _child_env(direct_interpreter(_console_python())[1])
 
 
-def tray_command(cfg: Config, log_file: str | os.PathLike) -> list[str]:
+def tray_command(cfg: Config, log_file: str | os.PathLike,
+                 open_browser: bool = False) -> list[str]:
     python, _ = direct_interpreter(_gui_python())
-    return _cli_command(python, cfg, ["tray", "--log-file", str(log_file)])
+    args = ["tray", "--log-file", str(log_file)] + (["--open"] if open_browser else [])
+    return _cli_command(python, cfg, args)
 
 
 def should_relaunch() -> bool:
@@ -242,8 +250,9 @@ def should_relaunch() -> bool:
 
 
 def relaunch(cfg: Config, log_file: str | os.PathLike,
-             popen: Callable[..., subprocess.Popen] = subprocess.Popen) -> int:
-    cmd = tray_command(cfg, log_file)
+             popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+             open_browser: bool = False) -> int:
+    cmd = tray_command(cfg, log_file, open_browser)
     env = _child_env(direct_interpreter(_gui_python())[1], **{RELAUNCHED_ENV: "1"})
     flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -438,12 +447,28 @@ def render_icon(state: str, logo: str | os.PathLike | None = None, size: int = 6
             half = h * size * 0.38
             draw.rounded_rectangle((x0, size / 2 - half, x0 + bar, size / 2 + half),
                                    radius=bar / 2, fill=(230, 237, 243, 255))
-    r = size * 0.2
-    cx = cy = size - r - 1
-    draw.ellipse((cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2), fill=(13, 17, 23, 255))
-    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(*_COLORS.get(state, (139, 148, 158)),
-                                                         255))
+    if state is not None:
+        r = size * 0.2
+        cx = cy = size - r - 1
+        draw.ellipse((cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2),
+                     fill=(13, 17, 23, 255))
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r),
+                     fill=(*_COLORS.get(state, (139, 148, 158)), 255))
     return canvas
+
+
+def _logo(cfg: Config) -> Path | None:
+    brand = cfg.browse_brand_dir
+    logo = brand / "logo.png" if brand is not None else None
+    return logo if logo is not None and logo.is_file() else None
+
+
+def save_icon(cfg: Config, path: str | os.PathLike) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = render_icon(None, _logo(cfg), size=256)
+    image.save(path, format="ICO", sizes=[(n, n) for n in (16, 24, 32, 48, 64, 128, 256)])
+    return path
 
 
 # ============================================================================== locking
@@ -491,8 +516,9 @@ def _open_path(path: Path) -> None:
 
 
 class _TrayApp:
-    def __init__(self, cfg: Config, log_file: Path, pystray):
+    def __init__(self, cfg: Config, log_file: Path, pystray, open_browser: bool = False):
         self.cfg = cfg
+        self._open_pending = open_browser  # open the browser once the server answers
         self.log_file = log_file
         self.url = local_url(cfg)
         self.supervisor = Supervisor(lambda: browse_command(cfg, log_file), env=browse_env)
@@ -502,9 +528,7 @@ class _TrayApp:
         self.busy: str | None = None
         self._quit = threading.Event()
         self._wake = threading.Event()
-        brand = cfg.browse_brand_dir
-        logo = brand / "logo.png" if brand is not None else None
-        self.logo = logo if logo is not None and logo.is_file() else None
+        self.logo = _logo(cfg)
         self._images: dict[str, object] = {}
         self.icon = pystray.Icon("foley", self._image(self.state),
                                  tooltip(self.state, self.url), menu=self._menu())
@@ -553,6 +577,9 @@ class _TrayApp:
         state = display_state(proc_state, self.status, self.busy)
         previous, self.state = self.state, state
         self.icon.title = tooltip(state, self.url, self.status)
+        if self._open_pending and state in ("running", "scanning"):
+            self._open_pending = False
+            self._on_open()
         if state != previous:
             self.icon.icon = self._image(state)
             self.icon.update_menu()
@@ -667,28 +694,31 @@ class _TrayApp:
             self.supervisor.stop()  # also when the icon loop ends some other way
 
 
-def _already_running(cfg: Config) -> int:
+def _already_running(cfg: Config, open_browser: bool = False) -> int:
     log.debug("foley tray: another foley tray is already running for %s", cfg.data_dir)
+    if open_browser:
+        webbrowser.open(local_url(cfg))
     if sys.stderr is not None:  # None under pythonw.exe
         print(f"foley tray: already running for {cfg.data_dir}", file=sys.stderr)
     return 0
 
 
-def run(cfg: Config, log_file: str | os.PathLike | None = None) -> int:
+def run(cfg: Config, log_file: str | os.PathLike | None = None,
+        open_browser: bool = False) -> int:
     log_path = Path(log_file) if log_file else default_log_file(cfg)
     configure_logging(tray_log_path(log_path))
     lock = _InstanceLock(cfg.data_dir / LOCK_FILE)
     if not lock.acquire():
-        return _already_running(cfg)
+        return _already_running(cfg, open_browser)
     if should_relaunch():
         lock.release()  # the copy takes it for real (see the contract)
         try:
-            pid = relaunch(cfg, log_path)
+            pid = relaunch(cfg, log_path, open_browser=open_browser)
         except OSError as e:
             log.warning("foley tray: cannot start on the base interpreter (%s); "
                         "running through the launcher instead", e)
             if not lock.acquire():
-                return _already_running(cfg)
+                return _already_running(cfg, open_browser)
         else:
             log.info("foley tray: continuing as pid %s on the base interpreter", pid)
             return 0
@@ -703,7 +733,7 @@ def run(cfg: Config, log_file: str | os.PathLike | None = None) -> int:
 
         log.info("foley tray %s starting (pid %s, config %s, server log %s)",
                  __version__, os.getpid(), cfg.source, log_path)
-        _TrayApp(cfg, log_path, pystray).run()
+        _TrayApp(cfg, log_path, pystray, open_browser).run()
         log.info("foley tray: quit")
         return 0
     finally:
